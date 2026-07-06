@@ -1354,13 +1354,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     if wrap_response:
         task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
+            f"# {task_name}\n\n"
             f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f"---\n"
+            f"*To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\").*"
         )
     else:
         delivery_content = content

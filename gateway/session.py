@@ -192,10 +192,12 @@ class SessionSource:
             parts.append(f"group: {self.chat_name or self.chat_id}")
         elif self.chat_type == "channel":
             parts.append(f"channel: {self.chat_name or self.chat_id}")
+        elif self.chat_type == "thread":
+            parts.append(f"thread in {self.chat_name or self.chat_id}")
         else:
             parts.append(self.chat_name or self.chat_id)
         
-        if self.thread_id:
+        if self.thread_id and self.chat_type != "thread":
             parts.append(f"thread: {self.thread_id}")
         
         return ", ".join(parts)

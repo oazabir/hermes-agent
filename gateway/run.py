@@ -15641,6 +15641,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
+        # Cancel any pending clarify entries for this session so blocked
+        # agent threads don't stay alive through the 10-minute timeout.
+        # clear_session() sets entry.event.set() which unblocks
+        # wait_for_response() — the thread unwinds promptly instead of
+        # waiting for the full 10-minute timeout.
+        try:
+            from tools.clarify_gateway import clear_session as _clear_clarify_session
+            _clear_clarify_session(session_key)
+        except Exception:
+            pass
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
         adapter = self._adapter_for_source(source)
         if adapter and hasattr(adapter, "interrupt_session_activity"):

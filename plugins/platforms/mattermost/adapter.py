@@ -876,11 +876,14 @@ class MattermostAdapter(BasePlatformAdapter):
             thread_id = post_id
 
         # Determine message type.
+        # Mattermost intercepts /-prefixed messages client-side as slash
+        # commands — they never reach the bot via WebSocket.  Use a
+        # backslash prefix (\command) instead so users can explicitly
+        # invoke gateway commands without them being intercepted.
         file_ids = post.get("file_ids") or []
         msg_type = MessageType.TEXT
-        if message_text[:1].isspace() and message_text.lstrip().startswith("/"):
-            message_text = message_text.lstrip()
-        if message_text.startswith("/"):
+        if message_text.startswith("\\"):
+            message_text = "/" + message_text[1:]
             msg_type = MessageType.COMMAND
 
         # Download file attachments immediately (URLs require auth headers
@@ -956,6 +959,20 @@ class MattermostAdapter(BasePlatformAdapter):
             media_types=media_types if media_types else None,
             channel_prompt=_channel_prompt,
         )
+
+        # Send instant "thinking..." acknowledgment before processing.
+        # This gives the user immediate feedback that their message was received
+        # while the agent processes the request in the background.
+        _think_root_id = (
+            thread_id
+            if self._reply_mode == "thread"
+            else (post.get("root_id") or None)
+        )
+        await self._api_post("posts", {
+            "channel_id": channel_id,
+            "message": "thinking...",
+            **({ "root_id": _think_root_id } if _think_root_id else {}),
+        })
 
         await self.handle_message(msg_event)
 
