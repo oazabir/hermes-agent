@@ -303,9 +303,83 @@ hermes sessions export telegram-history.jsonl --source telegram
 
 # Export a single session
 hermes sessions export session.jsonl --session-id 20250305_091523_a1b2c3d4
+
+# Redact API keys/tokens/credentials from the exported content
+hermes sessions export backup.jsonl --redact
 ```
 
 Exported files contain one JSON object per line with full session metadata and all messages.
+
+`export` accepts the same filters as `prune` / `archive` — `--older-than` / `--newer-than` / `--before` / `--after` (durations like `5h`/`2d`/`1w`, bare days, or ISO timestamps), `--source`, `--title`, `--model`, `--provider`, `--cwd`, `--min-messages` / `--max-messages`, `--min-tokens` / `--max-tokens`, `--min-cost` / `--max-cost`, `--min-tool-calls` / `--max-tool-calls`, `--user`, `--chat-id`, `--chat-type`, `--branch`, and `--end-reason`. Add `--dry-run` to preview which sessions match without writing anything. Note: bulk filters match *ended* sessions; unfiltered `export` dumps everything, including active ones.
+
+### Export Sessions to HTML
+
+`--format html` writes a single self-contained HTML file — no remote dependencies — with styled message bubbles, collapsible tool output, and (for multi-session exports) a sidebar to switch between sessions:
+
+```bash
+# One session as a standalone HTML page
+hermes sessions export --format html --session-id 20250305_091523_a1b2c3d4 transcript.html
+
+# All Telegram sessions from the last week in one file, secrets redacted
+hermes sessions export --format html --newer-than 1w --source telegram --redact archive.html
+```
+
+### Export Only Your Prompts
+
+`--only user-prompts` exports just the prompts you wrote — no assistant replies, tool output, or system context. Useful for building prompt libraries or reviewing what you asked:
+
+```bash
+# One JSONL record per prompt (session id, index, timestamp, text)
+hermes sessions export prompts.jsonl --session-id 20250305_091523_a1b2c3d4 --only user-prompts
+
+# Markdown, straight to stdout
+hermes sessions export - --session-id 20250305_091523_a1b2c3d4 --only user-prompts --format md
+```
+
+Works with `--format jsonl` (default) or `md`, honors the same filters for bulk export, and combines with `--redact`.
+
+### Export Traces to the HF Agent Trace Viewer
+
+`--format trace` emits Claude Code JSONL — the transcript shape the Hugging Face Hub auto-detects for its [Agent Trace Viewer](https://huggingface.co/docs/hub/agent-traces). Write it locally, or add `--upload` to push it to your own private `hermes-traces` dataset (reads `HF_TOKEN`):
+
+```bash
+# Trace of the most recent session, to stdout
+hermes sessions export --format trace
+
+# One session to a local trace file
+hermes sessions export --format trace --session-id 20250305_091523_a1b2c3d4 trace.jsonl
+
+# Upload straight to your private HF traces dataset
+hermes sessions export --format trace --session-id 20250305_091523_a1b2c3d4 --upload
+```
+
+Trace exports are secret-redacted by default (they're meant to leave the machine); `--no-redact` opts out after manual review. `--upload` is private unless `--public`. Bulk trace export with filters writes one `<id>.trace.jsonl` per session.
+
+### Export Sessions to Markdown/QMD
+
+Pass `--format md` or `--format qmd` when you want a readable, file-based archive before hiding or deleting old sessions. Markdown/QMD exports write one file per session into a directory (default: `~/.hermes/session-exports`).
+
+```bash
+# Export one session to Markdown
+hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4
+
+# Export a compression lineage as one logical document
+hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --lineage logical
+
+# Preview ended sessions older than 90 days without writing files
+hermes sessions export --format md --older-than 90 --dry-run
+
+# Export ended Telegram sessions older than 2 weeks to QMD files
+hermes sessions export --format qmd --older-than 2w --source telegram
+
+# Export long Claude sessions, secrets redacted
+hermes sessions export --format md --model sonnet --min-messages 50 --redact
+
+# Only after verification, export and delete one explicitly named session
+hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --delete-after-verified --yes
+```
+
+Markdown/QMD export writes one `.md` or `.qmd` file per exported session plus a `manifest.jsonl` with the file path, message count, lineage ids, and SHA-256. Bulk export requires at least one filter; a bare bulk export is refused. `--delete-after-verified` is intentionally limited to `--session-id` and requires `--yes`. `--redact` scrubs secrets (API keys, tokens, credentials) from message content and tool output before writing — recommended for any export you plan to share.
 
 ### Delete a Session
 
@@ -541,12 +615,13 @@ That reverts groups/channels to a single shared session per room, which preserve
 
 ### Session Reset Policies
 
-Gateway sessions are automatically reset based on configurable policies:
+**By default gateway sessions never auto-reset** (`mode: none`). You can opt
+in to automatic resets via the `session_reset` section in `config.yaml`:
 
+- **none** — never auto-reset (default; context managed by `/reset` and compression)
 - **idle** — reset after N minutes of inactivity
 - **daily** — reset at a specific hour each day
 - **both** — reset on whichever comes first (idle or daily)
-- **none** — never auto-reset
 
 Before a session is auto-reset, the agent is given a turn to save any important memories or skills from the conversation.
 
