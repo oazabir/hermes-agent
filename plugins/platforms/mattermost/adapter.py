@@ -104,6 +104,9 @@ class MattermostAdapter(BasePlatformAdapter):
         # Dedup cache (prevent reprocessing)
         self._dedup = MessageDeduplicator()
 
+        # Track threads the bot is participating in (thread root post IDs).
+        self._bot_threads: set[str] = set()
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -116,38 +119,44 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _api_get(self, path: str) -> Dict[str, Any]:
         """GET /api/v4/{path}."""
-        import aiohttp
         if ".." in path:
             logger.error("MM API path traversal blocked: %s", path)
             return {}
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
-        try:
-            async with self._session.get(url, headers=self._headers(), timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+        # "Timeout context manager should be used inside a task" errors when
+        # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+        async def _do():
+            async with self._session.get(url, headers=self._headers()) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.error("MM API GET %s → %s: %s", path, resp.status, body[:200])
                     return {}
                 return await resp.json()
-        except aiohttp.ClientError as exc:
-            logger.error("MM API GET %s network error: %s", path, exc)
+        try:
+            return await asyncio.wait_for(_do(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.error("MM API GET %s timed out", path)
+            return {}
+        except Exception as exc:
+            logger.error("MM API GET %s error: %s", path, exc)
             return {}
 
     async def _api_post(
         self, path: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
         """POST /api/v4/{path} with JSON body."""
-        import aiohttp
         if ".." in path:
             logger.error("MM API path traversal blocked: %s", path)
             return {}
         url = f"{self._base_url}/api/v4/{path.lstrip('/')}"
         self._last_post_status = None
         self._last_post_error = ""
-        try:
-            async with self._session.post(
-                url, headers=self._headers(), json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
+        # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+        # "Timeout context manager should be used inside a task" errors when
+        # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+        async def _do():
+            async with self._session.post(url, headers=self._headers(), json=payload) as resp:
                 self._last_post_status = resp.status
                 if resp.status >= 400:
                     body = await resp.text()
@@ -155,9 +164,15 @@ class MattermostAdapter(BasePlatformAdapter):
                     logger.error("MM API POST %s → %s: %s", path, resp.status, body[:200])
                     return {}
                 return await resp.json()
-        except aiohttp.ClientError as exc:
+        try:
+            return await asyncio.wait_for(_do(), timeout=30)
+        except asyncio.TimeoutError:
+            self._last_post_error = "request timed out"
+            logger.error("MM API POST %s timed out", path)
+            return {}
+        except Exception as exc:
             self._last_post_error = str(exc)
-            logger.error("MM API POST %s network error: %s", path, exc)
+            logger.error("MM API POST %s error: %s", path, exc)
             return {}
 
     async def _thread_root_for_send(
@@ -194,6 +209,9 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Post once, optionally falling back flat for final notify content."""
         data = await self._api_post("posts", payload)
+        if data and "root_id" in payload:
+            # Record this thread root so we know the bot is participating.
+            self._bot_threads.add(payload["root_id"])
         if data or "root_id" not in payload:
             return data
         if not (isinstance(metadata, dict) and metadata.get("notify")):
@@ -252,14 +270,26 @@ class MattermostAdapter(BasePlatformAdapter):
             content_type=content_type,
         )
         headers = {"Authorization": f"Bearer {self._token}"}
-        async with self._session.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                logger.error("MM file upload → %s: %s", resp.status, body[:200])
-                return None
-            data = await resp.json()
-            infos = data.get("file_infos", [])
-            return infos[0]["id"] if infos else None
+        # Use asyncio.wait_for() instead of aiohttp ClientTimeout to avoid
+        # "Timeout context manager should be used inside a task" errors when
+        # invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+        async def _do():
+            async with self._session.post(url, headers=headers, data=form) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM file upload → %s: %s", resp.status, body[:200])
+                    return None
+                data = await resp.json()
+                infos = data.get("file_infos", [])
+                return infos[0]["id"] if infos else None
+        try:
+            return await asyncio.wait_for(_do(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.error("MM file upload timed out")
+            return None
+        except Exception as exc:
+            logger.error("MM file upload error: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Required overrides
@@ -829,36 +859,115 @@ class MattermostAdapter(BasePlatformAdapter):
                 )
                 return
 
-            require_mention = os.getenv(
-                "MATTERMOST_REQUIRE_MENTION", "true"
-            ).lower() not in {"false", "0", "no"}
-
-            free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
-            free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
-            is_free_channel = channel_id in free_channels
-
-            mention_patterns = [
-                f"@{self._bot_username}",
-                f"@{self._bot_user_id}",
-            ]
-            has_mention = any(
-                pattern.lower() in message_text.lower()
-                for pattern in mention_patterns
-            )
-
-            if require_mention and not is_free_channel and not has_mention:
-                logger.debug(
-                    "Mattermost: skipping non-DM message without @mention (channel=%s)",
-                    channel_id,
-                )
-                return
-
-            # Strip @mention from the message text so the agent sees clean input.
-            if has_mention:
+            # Thread replies: only respond in threads the bot started.
+            thread_root = post.get("root_id")
+            if thread_root:
+                if thread_root not in self._bot_threads:
+                    # Check if the root post itself mentions the bot (thread
+                    # was started by mentioning the bot). This handles the
+                    # case after gateway restart when _bot_threads is empty.
+                    root_post = await self._api_get(f"posts/{thread_root}")
+                    if root_post:
+                        root_msg = root_post.get("message", "")
+                        mention_patterns = [
+                            f"@{self._bot_username}",
+                            f"@{self._bot_user_id}",
+                        ]
+                        root_has_mention = any(
+                            p.lower() in root_msg.lower()
+                            for p in mention_patterns
+                        )
+                        if root_has_mention:
+                            self._bot_threads.add(thread_root)
+                    if thread_root not in self._bot_threads:
+                        logger.debug(
+                            "Mattermost: ignoring thread reply in non-bot thread (root=%s, channel=%s)",
+                            thread_root, channel_id,
+                        )
+                        return
+                # In threads the bot started: respond to ALL replies automatically,
+                # unless the reply mentions someone else (directed at them).
+                # This means the user only needs to @mention the bot once to
+                # start the thread; subsequent replies flow without re-mentioning.
+                mention_patterns = [
+                    f"@{self._bot_username}",
+                    f"@{self._bot_user_id}",
+                ]
+                # Check if the reply mentions someone other than the bot.
+                all_mentions = re.findall(r"@\S+", message_text)
+                non_bot_mentions = [
+                    m for m in all_mentions
+                    if m.lower() not in {p.lower() for p in mention_patterns}
+                ]
+                if non_bot_mentions:
+                    logger.debug(
+                        "Mattermost: ignoring thread reply directed at others (root=%s, channel=%s, mentions=%s)",
+                        thread_root, channel_id, non_bot_mentions,
+                    )
+                    return
+                # Strip @mention from the message text so the agent sees clean input.
                 for pattern in mention_patterns:
                     message_text = re.sub(
                         re.escape(pattern), "", message_text, flags=re.IGNORECASE
                     ).strip()
+                # Fetch the original message that started this thread so the
+                # agent has full context of what was asked.
+                root_post = await self._api_get(f"posts/{thread_root}")
+                if root_post:
+                    root_message = root_post.get("message", "")
+                    root_sender = root_post.get("user_id", "")
+                    if root_sender == self._bot_user_id:
+                        # The thread root is the bot's own reply. Fetch the
+                        # user's message that the bot replied to.
+                        parent_id = root_post.get("root_id")
+                        if parent_id:
+                            parent_post = await self._api_get(f"posts/{parent_id}")
+                            if parent_post:
+                                parent_msg = parent_post.get("message", "")
+                                if parent_msg:
+                                    message_text = (
+                                        f"[Original message that started this thread: "
+                                        f"{parent_msg}]\n\n{message_text}"
+                                    )
+                    else:
+                        # The thread root is the user's original mention.
+                        # Inject it as context for the agent.
+                        if root_message:
+                            message_text = (
+                                f"[Original message that started this thread: "
+                                f"{root_message}]\n\n{message_text}"
+                            )
+            else:
+                require_mention = os.getenv(
+                    "MATTERMOST_REQUIRE_MENTION", "true"
+                ).lower() not in {"false", "0", "no"}
+
+                free_channels_raw = os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS", "")
+                free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+                is_free_channel = channel_id in free_channels
+
+                mention_patterns = [
+                    f"@{self._bot_username}",
+                    f"@{self._bot_user_id}",
+                ]
+                has_mention = any(
+                    pattern.lower() in message_text.lower()
+                    for pattern in mention_patterns
+                )
+
+                if require_mention and not is_free_channel and not has_mention:
+                    logger.debug(
+                        "Mattermost: skipping non-DM message without @mention (channel=%s)",
+                        channel_id,
+                    )
+                    return
+
+                # Strip @mention from the message text so the agent sees clean input.
+                if has_mention:
+                    for pattern in mention_patterns:
+                        message_text = re.sub(
+                            re.escape(pattern), "", message_text, flags=re.IGNORECASE
+                        ).strip()
 
         # Resolve sender info.
         sender_id = post.get("user_id", "")
@@ -880,10 +989,17 @@ class MattermostAdapter(BasePlatformAdapter):
         # commands — they never reach the bot via WebSocket.  Use a
         # backslash prefix (\command) instead so users can explicitly
         # invoke gateway commands without them being intercepted.
+        # Both / and \ are accepted as command prefixes.
         file_ids = post.get("file_ids") or []
         msg_type = MessageType.TEXT
         if message_text.startswith("\\"):
             message_text = "/" + message_text[1:]
+            msg_type = MessageType.COMMAND
+            logger.debug(
+                "Mattermost: backslash command detected, converted '%s' → '%s'",
+                post.get("message", ""), message_text,
+            )
+        elif message_text.startswith("/"):
             msg_type = MessageType.COMMAND
 
         # Download file attachments immediately (URLs require auth headers
