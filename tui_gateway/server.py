@@ -2411,7 +2411,7 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -2423,7 +2423,10 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     answer_present = False
     try:
         _emit(event, sid, payload)
-        answered = ev.wait(timeout=timeout)
+        # Natural Event semantics: None → wait forever (clarify configured with
+        # clarify_timeout <= 0, released only by a real answer or
+        # session.interrupt), 0 → return immediately, > 0 → bounded wait.
+        answered = ev.wait(timeout)
     finally:
         with _prompt_lock:
             _pending.pop(rid, None)
@@ -2431,13 +2434,38 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
             answer_present = rid in _answers
             answer = _answers.pop(rid, "")
 
-    if not answered and not answer_present and event in {"secret.request", "sudo.request"}:
+    # Emit an `.expire` notification on timeout for every blocking request type
+    # whose `*.respond` handler tolerates a late reply (allow_expired=True).
+    # All four blocking bridges — secret, sudo, clarify, terminal.read — share
+    # the same lifecycle: the tool gives up on timeout and returns empty, but a
+    # slow renderer (or a reconnect that dropped tool.complete) can still answer
+    # afterward. Without this the late `*.respond` would hit the generic 4009
+    # "no pending request" error and clients would surface a raw JSON-RPC string.
+    if not answered and not answer_present and event in {
+        "secret.request",
+        "sudo.request",
+        "clarify.request",
+        "terminal.read.request",
+    }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
             sid,
             {"request_id": rid},
         )
     return answer
+
+
+def _clarify_timeout_seconds() -> float | None:
+    """Clarify wait (seconds) for the TUI/desktop bridge, from the same
+    canonical config the messaging gateway and CLI use. Falls back to the
+    historical 300s _block default if config can't be read. ``<= 0`` in config
+    means unlimited and is returned as ``None`` (never auto-skip)."""
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+        timeout = get_clarify_timeout()
+        return timeout if timeout > 0 else None
+    except Exception:
+        return 300
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -2921,7 +2949,7 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
     # this marker after prior conversation turns, and strict OpenAI-compatible
     # providers (vLLM, Qwen) reject system messages that are not at the
     # beginning of the API message list (#48338).
-    entry = {"role": "user", "content": marker}
+    entry = {"role": "user", "content": marker, "display_kind": "model_switch"}
 
     lock = session.get("history_lock")
     if lock is not None:
@@ -2936,14 +2964,22 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
         agent = session.get("agent")
         db = getattr(agent, "_session_db", None) if agent is not None else None
         if db is not None:
-            db.append_message(session_id=session_key, role="user", content=marker)
+            db.append_message(
+                session_id=session_key,
+                role="user",
+                content=marker,
+                display_kind="model_switch",
+            )
             return
 
         _ensure_session_db_row(session)
         with _session_db(session) as scoped_db:
             if scoped_db is not None:
                 scoped_db.append_message(
-                    session_id=session_key, role="user", content=marker
+                    session_id=session_key,
+                    role="user",
+                    content=marker,
+                    display_kind="model_switch",
                 )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
@@ -3269,6 +3305,14 @@ def _session_verbose(sid: str) -> bool:
 
 def _tool_progress_enabled(sid: str) -> bool:
     return _session_tool_progress_mode(sid) != "off"
+
+
+def _tool_lifecycle_required_for_ui(name: str) -> bool:
+    """Return True for tool events that are interactive UI, not optional chrome."""
+    # Desktop renders the clarify choices/question from the tool-call part, then
+    # wires request_id from clarify.request. If tool progress is off, suppressing
+    # clarify's lifecycle events leaves only the sidebar attention dot visible.
+    return name == "clarify"
 
 
 def _restart_slash_worker(sid: str, session: dict):
@@ -3606,6 +3650,14 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+class CompressionLockHeld(Exception):
+    """Raised by _compress_session_history when compression skipped due
+    to a concurrent lock on the session's compression_locks row."""
+    def __init__(self, holder: str | None = None):
+        self.holder = holder
+        super().__init__(f"Compression lock held: {holder or 'unknown'}")
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
@@ -3613,10 +3665,29 @@ def _compress_session_history(
     before_messages: list | None = None,
     history_version: int | None = None,
 ) -> tuple[int, dict]:
+    """Compress a session's history — the single choke point shared by all
+    three manual-compress routes (session.compress RPC, command.dispatch
+    /compress|/compact, and the slash-exec mirror).
+
+    ``focus_topic`` is the RAW argument string after ``/compress``. It is
+    parsed here with :func:`parse_partial_compress_args` so boundary-aware
+    forms (``here [N]``, ``up to here``, ``--keep N``) trigger a partial
+    compress — head summarized, most recent ``keep_last`` exchanges kept
+    verbatim — on EVERY route, mirroring cli.py's ``_manual_compress`` and
+    gateway/slash_commands.py (PR #35252). Parsing at the choke point (not
+    per-route) is what fixes #35533: previously "/compress here 3" reached
+    this helper unparsed and ran a FULL compress focused on the literal
+    text "here 3".
+    """
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
     )
     from agent.model_metadata import estimate_request_tokens_rough
+    from hermes_cli.partial_compress import (
+        parse_partial_compress_args,
+        rejoin_compressed_head_and_tail,
+        split_history_for_partial_compress,
+    )
 
     agent = session["agent"]
     # Snapshot history under the lock so the LLM-bound compression call
@@ -3631,6 +3702,18 @@ def _compress_session_history(
     if len(history) < 4:
         usage = _get_usage(agent)
         return 0, usage
+    partial, keep_last, focus_topic = parse_partial_compress_args(focus_topic or "")
+    # Boundary-aware split: only the head is summarized; the most recent
+    # `keep_last` exchanges ride along verbatim. A degenerate split (empty
+    # tail — everything would be kept, or no head left to compress) falls
+    # back to full compression so the user still gets an action.
+    tail: list = []
+    head = history
+    if partial:
+        head, tail = split_history_for_partial_compress(history, keep_last)
+        if not tail:
+            partial = False
+            head = history
     if approx_tokens is None:
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
@@ -3644,12 +3727,21 @@ def _compress_session_history(
     # cached prompt (which already contains the agent identity block)
     # makes the rebuild append the identity a second time. Mirrors the
     # CLI's _manual_compress fix for issue #15281.
+    # force=True: every caller of this helper is a manual /compress path
+    # (session.compress RPC, slash compress/compact, slash-worker mirror) —
+    # auto-compaction runs inside the agent loop, not here. Manual
+    # compaction bypasses the summary-failure cooldown, matching the CLI
+    # and gateway handlers.
     try:
         compressed, _ = agent._compress_context(
-            history,
+            head,
             None,
             approx_tokens=approx_tokens,
+            # Partial compress has no focus topic (the modes are exclusive;
+            # parse_partial_compress_args returns focus_topic=None for the
+            # boundary-aware forms).
             focus_topic=focus_topic or None,
+            force=True,
             defer_context_engine_notification=True,
         )
     except Exception:
@@ -3658,6 +3750,26 @@ def _compress_session_history(
             committed=False,
         )
         raise
+    # If _compress_context returned unchanged because a concurrent
+    # compression lock is held, raise so callers can surface a clear
+    # message instead of the misleading "No changes from compression" text.
+    # Type-pinned (is True / str): real values are None/True/holder-string;
+    # bare truthiness is fooled by MagicMock auto-attrs on test doubles.
+    _lock_skipped = getattr(agent, "_compression_skipped_due_to_lock", None)
+    if _lock_skipped is True or isinstance(_lock_skipped, str):
+        agent._compression_skipped_due_to_lock = None
+        # No boundary was committed on a lock-skip; discard any pending
+        # deferred context-engine notification (exactly-once, no-op safe).
+        finalize_context_engine_compression_notification(
+            agent,
+            committed=False,
+        )
+        raise CompressionLockHeld(
+            _lock_skipped if isinstance(_lock_skipped, str) else None
+        )
+
+    if partial and tail:
+        compressed = rejoin_compressed_head_and_tail(compressed, tail)
     with session["history_lock"]:
         if int(session.get("history_version", 0)) != history_version:
             # External mutation during compaction — drop the compressed
@@ -3824,11 +3936,15 @@ def _get_usage(agent) -> dict:
 
 
 def _probe_credentials(agent) -> str:
-    """Light credential check at session creation — returns warning or ''."""
+    """Light credential check at session creation — returns warning or ''.
+
+    ``no-key-required`` is a valid sentinel for keyless custom providers; only
+    warn when the key is genuinely missing.
+    """
     try:
         key = getattr(agent, "api_key", "") or ""
         provider = getattr(agent, "provider", "") or ""
-        if not key or key == "no-key-required":
+        if not key:
             return f"No API key configured for provider '{provider}'. First message will fail."
     except Exception:
         pass
@@ -4202,7 +4318,7 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         except Exception:
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
-    if _tool_progress_enabled(sid):
+    if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
         payload = {
             "tool_id": tool_call_id,
             "name": name,
@@ -4260,7 +4376,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
-    if _tool_progress_enabled(sid) or payload.get("inline_diff"):
+    if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
         _emit("tool.complete", sid, payload)
 
 
@@ -4513,7 +4629,10 @@ def _agent_cbs(sid: str) -> dict:
             "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
+            "clarify.request",
+            sid,
+            {"question": q, "choices": c},
+            timeout=_clarify_timeout_seconds(),
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -5625,6 +5744,20 @@ def _is_text_only_busy_payload(content: Any) -> bool:
     return False
 
 
+def _is_display_hidden_marker(role: str | None, text: str) -> bool:
+    """Gateway bookkeeping notices (model-switch, personality) are persisted as
+    role=user ``[System: …]`` rows so strict providers accept them mid-history.
+    They are model-facing runtime metadata, not user turns, and must never
+    render as a user bubble in ANY client transcript (desktop, TUI, CLI, web).
+
+    Filtering here — the single display projection every surface reads — hides
+    them everywhere while the raw marker stays in ``session["history"]`` for the
+    model. It also removes the stored marker from the payload the desktop
+    reconciles against, so it can no longer shift user-message ordinals and
+    duplicate the optimistic prompt (#67603)."""
+    return role == "user" and text.lstrip().startswith("[System:")
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -5636,6 +5769,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if role not in {"user", "assistant", "tool", "system"}:
             continue
         content_text = _coerce_message_text(m.get("content"))
+        if _is_display_hidden_marker(role, content_text):
+            continue
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 fn = tc.get("function", {})
@@ -5680,6 +5815,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             for key in reasoning_keys:
                 if key in m and m.get(key) is not None:
                     msg[key] = m.get(key)
+        # Forward display-only timeline metadata so the TUI can render
+        # model switches and delegation completions as events instead of
+        # opaque user messages, and hide compaction handoffs entirely.
+        if m.get("display_kind"):
+            msg["display_kind"] = m["display_kind"]
+        if m.get("display_metadata"):
+            msg["display_metadata"] = m["display_metadata"]
         messages.append(msg)
 
     return messages
@@ -5763,6 +5905,20 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
         turn = {"assistant": "", "streaming": True, "user": ""}
     turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
     turn["streaming"] = True
+    turn["updated_at"] = time.time()
+    session["inflight_turn"] = turn
+
+
+def _replace_inflight_user(session: dict, text: Any) -> None:
+    """Reflect an accepted correction as the live turn's current user text."""
+    user = _inflight_text(text)
+    if not user:
+        return
+    turn = session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return
+    turn = dict(turn)
+    turn["user"] = user
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
 
@@ -5872,6 +6028,7 @@ def _handle_busy_submit(
         try:
             if agent.redirect(plain_text):
                 with session["history_lock"]:
+                    _replace_inflight_user(session, plain_text)
                     session["last_active"] = time.time()
                 return _ok(rid, {"status": "redirected"})
         except Exception:
@@ -9230,6 +9387,16 @@ def _(rid, params: dict) -> dict:
             # reverts to neutral whether compaction succeeded, was a
             # no-op, or raised.
             _status_update(sid, "ready")
+    except CompressionLockHeld as e:
+        _status_update(sid, "ready")
+        from agent.manual_compression_feedback import (
+            describe_compression_lock_skip,
+        )
+        return _ok(rid, {
+            "compressed": False,
+            "lock_held": True,
+            "message": describe_compression_lock_skip(e.holder),
+        })
     except Exception as e:
         finalize_context_engine_compression_notification(
             session["agent"],
@@ -9409,6 +9576,9 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
+    # Keypress barge-in: stopping the turn also silences its streaming TTS
+    # (voice is process-global, so no per-session scoping is needed).
+    _tts_stream_stop()
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -9752,7 +9922,9 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         return _err(rid, 5000, f"redirect failed: {exc}")
     if accepted:
-        session["last_active"] = time.time()
+        with session["history_lock"]:
+            _replace_inflight_user(session, text)
+            session["last_active"] = time.time()
     return _ok(
         rid,
         {"status": "redirected" if accepted else "rejected", "text": text},
@@ -9779,6 +9951,12 @@ def _(rid, params: dict) -> dict:
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
+    if params.get("interrupted"):
+        # Client-side barge-in (desktop VAD / typing over playback) — latch it
+        # so this turn's model message carries the interruption note.
+        from tools.tts_streaming import mark_speech_interrupted
+
+        mark_speech_interrupted()
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -9866,7 +10044,7 @@ def _(rid, params: dict) -> dict:
                 "error",
                 sid,
                 {
-                    "message": err.get("error", {}).get(
+                    "message": (err.get("error") or {}).get(
                         "message", "agent initialization failed"
                     )
                 },
@@ -10152,7 +10330,17 @@ def _notification_poller_loop(
             continue
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            if evt.get("type") == "async_delegation":
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="async_delegation_complete",
+                    display_metadata=_async_delegation_display_metadata(evt),
+                )
+            else:
+                _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10220,7 +10408,17 @@ def _notification_poller_loop(
             continue
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            if evt.get("type") == "async_delegation":
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="async_delegation_complete",
+                    display_metadata=_async_delegation_display_metadata(evt),
+                )
+            else:
+                _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10235,6 +10433,33 @@ def _notification_poller_loop(
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
         process_registry.completion_queue.put(evt)
+
+
+def _async_delegation_display_metadata(evt: dict) -> dict:
+    """Build display-only metadata before the completion event is formatted."""
+    raw_results = evt.get("results")
+    results: list[dict] = [
+        result for result in raw_results if isinstance(result, dict)
+    ] if isinstance(raw_results, list) else []
+    task_count = len(results) or 1
+    completed_count = sum(
+        1 for result in results
+        if result.get("status") in {"completed", "success"}
+    )
+    failed_count = sum(
+        1 for result in results
+        if result.get("status") in {"failed", "error"}
+    )
+    metadata = {
+        "delegation_id": str(evt.get("delegation_id") or ""),
+        "task_count": task_count,
+        "completed_count": completed_count or task_count - failed_count,
+        "failed_count": failed_count,
+    }
+    duration = evt.get("total_duration_seconds") or evt.get("duration_seconds")
+    if isinstance(duration, (int, float)):
+        metadata["duration_seconds"] = duration
+    return metadata
 
 
 def _wire_agent_terminal_output() -> None:
@@ -10318,7 +10543,10 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
+    display_metadata: dict | None = None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -10339,6 +10567,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         one_turn_restore = session.pop("one_turn_model_restore", None)
         try:
             from tools.approval import (
@@ -10427,6 +10656,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         _provider,
                         _model,
                         _cfg,
+                        requested_provider=getattr(
+                            agent, "requested_provider", ""
+                        ),
                     )
                     if getattr(agent, "api_mode", "") == "codex_app_server":
                         _mode = "text"
@@ -10461,12 +10693,32 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 else:
                     run_message = _enrich_with_attached_images(prompt, images)
 
+            # Streaming TTS: voice-mode replies are spoken sentence-by-sentence
+            # as tokens arrive (CLI parity) instead of after the full turn.
+            # begin() first — it cuts any still-speaking previous turn, and
+            # that cut IS this turn's barge-in, so it must latch before we
+            # consume the latch below.
+            tts_queue = _tts_stream_begin()
+
+            # Barged mid-speech? Tell the model (API-message note, same
+            # enrichment channel as attached images) so it can react
+            # ("rude!") instead of being oblivious to its own interruption.
+            from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
+
+            if take_speech_interrupted():
+                if isinstance(run_message, str):
+                    run_message = f"{SPEECH_INTERRUPTED_NOTE}\n\n{run_message}"
+                elif isinstance(run_message, list):
+                    run_message = [{"type": "text", "text": SPEECH_INTERRUPTED_NOTE}, *run_message]
+
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
+                if tts_queue is not None and isinstance(delta, str):
+                    tts_queue.put(delta)
                 _emit("message.delta", sid, payload)
 
             # Surface interim assistant text (commentary emitted alongside
@@ -10495,6 +10747,27 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
+            if display_kind and isinstance(text, str):
+                db = getattr(agent, "_session_db", None)
+                current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
+                if db is not None:
+                    try:
+                        db.set_latest_matching_message_display_kind(
+                            current_session_id,
+                            role="user",
+                            content=text,
+                            display_kind=display_kind,
+                            display_metadata=display_metadata,
+                        )
+                    except Exception:
+                        logger.debug("failed to stamp synthetic display kind", exc_info=True)
+                if isinstance(result, dict) and isinstance(result.get("messages"), list):
+                    for message in reversed(result["messages"]):
+                        if message.get("role") == "user" and message.get("content") == text:
+                            message["display_kind"] = display_kind
+                            if display_metadata:
+                                message["display_metadata"] = display_metadata
+                            break
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
@@ -10608,6 +10881,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 payload["warning"] = status_note
             if result.get("response_previewed"):
                 payload["response_previewed"] = True
+            # Forward the structured billing-wall descriptor (provider,
+            # billing_url, is_nous, message) so the TUI/desktop render a
+            # billing-specific recovery surface instead of re-parsing text.
+            _billing_block = result.get("billing_block") if isinstance(result, dict) else None
+            if _billing_block:
+                payload["billing"] = _billing_block
+                payload["failure_reason"] = result.get("failure_reason")
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
@@ -10735,12 +11015,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 except Exception:
                     pass
 
-            # CLI parity: when voice-mode TTS is on, speak the agent reply
-            # (cli.py:_voice_speak_response).  Only the final text — tool
-            # calls / reasoning already stream separately and would be
-            # noisy to read aloud.
+            # Voice TTS fallback: when the streaming pipeline couldn't start
+            # (no provider / missing deps probed at turn start), speak the
+            # final text whole (cli.py:_voice_speak_response parity). The
+            # streaming path already spoke everything via tts_queue.
             if (
                 status == "complete"
+                and tts_queue is None
                 and isinstance(raw, str)
                 and raw.strip()
                 and _voice_tts_enabled()
@@ -10775,6 +11056,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
             _emit("error", sid, {"message": str(e)})
         finally:
+            if tts_queue is not None:
+                tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:
                 try:
                     _restore_agent_model_runtime(agent, one_turn_restore)
@@ -11682,13 +11965,20 @@ def _respond(rid, params, key, *, allow_expired=False):
 
 @method("clarify.respond")
 def _(rid, params: dict) -> dict:
-    return _respond(rid, params, "answer")
+    # allow_expired=True: a clarify can time out server-side (its entry is popped
+    # from _pending) while the card is still visible — common when a WebSocket
+    # reconnect during the wait drops tool.complete. A late answer must resolve
+    # gracefully instead of hitting the raw 4009 "no pending answer request".
+    return _respond(rid, params, "answer", allow_expired=True)
 
 
 @method("terminal.read.respond")
 def _(rid, params: dict) -> dict:
     # `text` is a JSON string of the serialized terminal buffer + line metadata.
-    return _respond(rid, params, "text")
+    # allow_expired=True: the read_terminal tool's _block() uses a short 30s
+    # timeout, so a slow renderer losing the race is the common case — a late
+    # response must not error after the tool already returned empty.
+    return _respond(rid, params, "text", allow_expired=True)
 
 
 @method("sudo.respond")
@@ -13673,6 +13963,10 @@ def _(rid, params: dict) -> dict:
     if hint:
         return _ok(rid, {"blocked": True, "hint": hint, "code": -1, "output": ""})
     try:
+        # CREATE_NO_WINDOW on Windows — under the desktop GUI's windowless
+        # parent, this spawn otherwise flashes a console (#56747).
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         r = subprocess.run(
             [sys.executable, "-m", "hermes_cli.main", *argv],
             capture_output=True,
@@ -13683,6 +13977,7 @@ def _(rid, params: dict) -> dict:
             # needs provider credentials. Tier-1 secrets still stripped (#29157).
             env=hermes_subprocess_env(inherit_credentials=True),
             stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
         parts = [r.stdout or "", r.stderr or ""]
         out = "\n".join(p for p in parts if p).strip() or "(no output)"
@@ -13742,6 +14037,8 @@ def _(rid, params: dict) -> dict:
             # has all API keys in os.environ.
             from tools.environments.local import _sanitize_subprocess_env
             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+            from hermes_cli._subprocess_compat import windows_hide_flags
+
             r = subprocess.run(
                 qc.get("command", ""),
                 shell=True,
@@ -13750,6 +14047,7 @@ def _(rid, params: dict) -> dict:
                 timeout=30,
                 stdin=subprocess.DEVNULL,
                 env=sanitized_env,
+                creationflags=windows_hide_flags(),
             )
             output = (
                 (r.stdout or "")
@@ -14273,6 +14571,19 @@ def _(rid, params: dict) -> dict:
                         filter(None, [summary["headline"], summary["token_line"], summary.get("note")])
                     ),
                 },
+            )
+        except CompressionLockHeld as e:
+            # Lock-skip is a clean no-op, not a failure: report it as
+            # normal command output (matching the slash-mirror and
+            # session.compress RPC), never as a "compress failed" error.
+            # _compress_session_history already discarded the deferred
+            # context-engine notification before raising.
+            from agent.manual_compression_feedback import (
+                describe_compression_lock_skip,
+            )
+            return _ok(
+                rid,
+                {"type": "exec", "output": describe_compression_lock_skip(e.holder)},
             )
         except Exception as exc:
             finalize_context_engine_compression_notification(
@@ -15328,7 +15639,17 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 else 0
             )
 
-            _compress_session_history(session, arg)
+            # The raw argument goes through unparsed: _compress_session_history
+            # (the choke point shared by all three manual-compress routes)
+            # parses the boundary-aware forms (here [N], up to here, --keep N)
+            # and does the partial head/tail split there (#35533).
+            try:
+                _compress_session_history(session, arg)
+            except CompressionLockHeld as e:
+                from agent.manual_compression_feedback import (
+                    describe_compression_lock_skip,
+                )
+                return describe_compression_lock_skip(e.holder)
             _sync_session_key_after_compress(sid, session)
 
             with session["history_lock"]:
@@ -15549,6 +15870,118 @@ def _voice_tts_enabled() -> bool:
     return os.environ.get("HERMES_VOICE_TTS", "").strip() == "1"
 
 
+# ── Streaming TTS (one active pipeline per process — one speaker) ──────────
+# Token deltas from the running turn feed a sentence-buffering consumer
+# (tools.tts_tool.stream_tts_to_speaker) so speech starts on the first
+# sentence instead of after the full reply. Voice is process-global, so a
+# single slot suffices; starting a new turn's pipeline barges in on the
+# previous one.
+
+_tts_stream_lock = threading.Lock()
+_tts_stream_state: Optional[dict] = None
+
+
+def _tts_stream_begin() -> Optional[queue.Queue]:
+    """Start a per-turn streaming TTS consumer; None when TTS can't stream."""
+    if not _voice_tts_enabled():
+        return None
+    try:
+        from tools.tts_tool import check_tts_requirements, stream_tts_to_speaker
+
+        if not check_tts_requirements():
+            return None
+    except Exception:
+        return None
+
+    _tts_stream_stop()
+    text_queue: queue.Queue = queue.Queue()
+    stop = threading.Event()
+    done = threading.Event()
+    threading.Thread(
+        target=stream_tts_to_speaker, args=(text_queue, stop, done), daemon=True
+    ).start()
+
+    global _tts_stream_state
+    with _tts_stream_lock:
+        _tts_stream_state = {"stop": stop, "done": done}
+
+    if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
+        threading.Thread(
+            target=_tts_stream_barge_in_monitor, args=(stop, done), daemon=True
+        ).start()
+
+    return text_queue
+
+
+def _tts_stream_stop(user_barge: bool = True) -> None:
+    """Cut any in-flight streaming TTS (new turn, interrupt, /voice off).
+
+    *user_barge* latches the interruption for the next turn's model note
+    (``mark_speech_interrupted``) — pass ``False`` for mode changes like
+    ``/voice off`` where the user isn't talking over the reply.
+    """
+    global _tts_stream_state
+    with _tts_stream_lock:
+        state, _tts_stream_state = _tts_stream_state, None
+    if state is None:
+        return
+    if user_barge and not state["done"].is_set():
+        from tools.tts_streaming import mark_speech_interrupted
+
+        mark_speech_interrupted()
+    state["stop"].set()
+    try:
+        from tools.voice_mode import stop_playback
+
+        stop_playback()
+    except Exception:
+        pass
+
+
+def _tts_stream_barge_in_monitor(stop: threading.Event, done: threading.Event) -> None:
+    """VAD barge-in: cut streaming TTS when the user starts talking.
+
+    Playback is cut at the moment of detection while the monitor keeps
+    capturing (with pre-roll) until the user goes quiet — the interruption is
+    then transcribed and emitted as ``voice.transcript``, which the TUI
+    submits like any spoken turn. Without capture the opening words would be
+    lost between detection and the next recording start.
+    """
+    try:
+        from tools.tts_streaming import mark_speech_interrupted
+        from tools.voice_mode import listen_for_speech, stop_playback, transcribe_recording
+
+        barged = threading.Event()
+
+        def _cut_playback():
+            if not done.is_set():
+                barged.set()
+                mark_speech_interrupted()
+                stop.set()
+                stop_playback()
+                _voice_emit("voice.interrupted")
+
+        wav_path = listen_for_speech(
+            lambda: stop.is_set() or done.is_set(),
+            capture=True,
+            on_trigger=_cut_playback,
+        )
+        if not (wav_path and barged.is_set()):
+            return
+        try:
+            result = transcribe_recording(wav_path)
+            text = (result.get("transcript") or "").strip() if result.get("success") else ""
+            if text:
+                _voice_emit("voice.transcript", {"text": text})
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+    except Exception as e:
+        logger.debug("TTS barge-in monitor failed: %s", e)
+
+
 def _voice_cfg_dict() -> dict:
     """Shape-safe accessor for the ``voice:`` block in config.yaml.
 
@@ -15636,8 +16069,10 @@ def _(rid, params: dict) -> dict:
             except Exception as e:
                 logger.warning("voice: stop_continuous failed during toggle off: %s", e)
 
-            # Clear TTS so it can be toggled independently after voice is off.
+            # Clear TTS so it can be toggled independently after voice is off,
+            # and silence any in-flight streaming speech.
             os.environ["HERMES_VOICE_TTS"] = "0"
+            _tts_stream_stop(user_barge=False)
 
         return _ok(
             rid,
@@ -15654,6 +16089,8 @@ def _(rid, params: dict) -> dict:
         new_value = not _voice_tts_enabled()
         # Runtime-only flag (CLI parity) — see voice.toggle on/off above.
         os.environ["HERMES_VOICE_TTS"] = "1" if new_value else "0"
+        if not new_value:
+            _tts_stream_stop(user_barge=False)
         # Include ``record_key`` on every branch so a /voice tts toggle
         # doesn't reset the TUI's cached shortcut to the default when a
         # user has a custom binding configured (Copilot review, round 2
@@ -16696,9 +17133,12 @@ def _(rid, params: dict) -> dict:
     except ImportError:
         return _err(rid, 5001, "shell.exec unavailable: approval safety module not importable")
     try:
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         r = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
             stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
         return _ok(
             rid,

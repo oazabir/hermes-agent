@@ -8,10 +8,16 @@ import { useComposerSubmit } from './use-composer-submit'
 interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
+  compacting?: boolean
   text?: string
 }
 
-function renderSubmitHook({ attachments = [], busy = false, text = '' }: SubmitHarnessOptions = {}) {
+function renderSubmitHook({
+  attachments = [],
+  busy = false,
+  compacting = false,
+  text = ''
+}: SubmitHarnessOptions = {}) {
   const draftRef = { current: text }
   const editor = document.createElement('div')
   editor.dataset.slot = 'composer-rich-input'
@@ -21,6 +27,7 @@ function renderSubmitHook({ attachments = [], busy = false, text = '' }: SubmitH
   const onSteer = vi.fn(async () => true)
   const onSubmit = vi.fn(async () => true)
   const queueCurrentDraft = vi.fn(() => true)
+
   const clearDraft = vi.fn(() => {
     draftRef.current = ''
     editorRef.current!.textContent = ''
@@ -32,6 +39,7 @@ function renderSubmitHook({ attachments = [], busy = false, text = '' }: SubmitH
       activeQueueSessionKeyRef: { current: 'stored-session' },
       attachments,
       busy,
+      compacting,
       clearDraft,
       disabled: false,
       draftRef,
@@ -63,7 +71,10 @@ describe('useComposerSubmit busy-turn routing', () => {
   })
 
   it('steers a plain-text follow-up instead of queueing or stopping', async () => {
-    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({ busy: true, text: 'change course' })
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'change course'
+    })
 
     act(() => {
       hook.result.current.submitDraft()
@@ -73,6 +84,23 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('queues a plain-text follow-up while the active turn is compacting', () => {
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      compacting: true,
+      text: 'wait for the summary'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
   })
 
   it('runs slash commands immediately while busy', async () => {
@@ -94,6 +122,7 @@ describe('useComposerSubmit busy-turn routing', () => {
 
   it('queues an attachment-bearing follow-up while busy', () => {
     const attachment: ComposerAttachment = { id: 'doc', kind: 'file', label: 'notes.txt' }
+
     const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
       attachments: [attachment],
       busy: true,
