@@ -54,6 +54,16 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Union, cast
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
+from agent.conversation_compression import (
+    COMPACTION_STATUS,
+    COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
+    IDLE_COMPACTION_STATUS_TEMPLATE,
+    PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+)
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from hermes_cli.config import cfg_get
@@ -105,6 +115,70 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _status_template_to_regex(template: str) -> str:
+    """Compile a compression status template constant into a regex source.
+
+    Literal text is escaped verbatim (so wording drift in
+    agent/conversation_compression.py cannot silently diverge from this
+    matcher — the constants ARE the wording) and each ``{field}`` format
+    placeholder is replaced with a numeric-ish pattern covering every value
+    the emit sites format in (ints, ``{:,}`` thousands separators).
+    """
+    parts = re.split(r"\{[^{}]*\}", template)
+    return r"[\d,]+".join(re.escape(part) for part in parts)
+
+
+# ROUTINE compression progress statuses, derived from the SAME template
+# constants the emit sites format (agent/conversation_compression.py, #69550)
+# — never re-inlined wording. Used ONLY by the opt-in
+# ``compression.progress_notices`` gate below (#52995) to decide which of the
+# noisy statuses matched by _TELEGRAM_NOISY_STATUS_RE are compression
+# progress (deliverable when the user opted in) versus unrelated aux/retry
+# chatter (always suppressed on chat surfaces). Failure notices and manual
+# /compress feedback never match _TELEGRAM_NOISY_STATUS_RE in the first
+# place, so they are unaffected by this gate.
+_COMPRESSION_PROGRESS_STATUS_RE = re.compile(
+    "|".join(
+        _status_template_to_regex(_template)
+        for _template in (
+            COMPACTION_STATUS,
+            PRE_API_COMPRESSION_STATUS_TEMPLATE,
+            PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
+            IDLE_COMPACTION_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
+        )
+    ),
+    re.IGNORECASE,
+)
+
+
+def _gateway_compression_progress_notices_enabled() -> bool:
+    """True when the user opted into routine compression progress notices.
+
+    Reads ``compression.progress_notices`` from the gateway's raw YAML config
+    (#52995). Default False — routine compression stays silent-by-design on
+    chat platforms unless explicitly enabled. Read live (mtime-cached) so a
+    config edit on a running gateway takes effect on the next status.
+    Fail-closed: any config read error keeps the silent default.
+    """
+    try:
+        config = _load_gateway_config()
+        compression_cfg = config.get("compression") if isinstance(config, dict) else None
+        if isinstance(compression_cfg, dict):
+            return str(compression_cfg.get("progress_notices", False)).strip().lower() in {
+                "true",
+                "1",
+                "yes",
+                "on",
+            }
+    except Exception:
+        pass
+    return False
 
 # Surfaces that consume gateway text programmatically (CLI/TUI "local"
 # diagnostics, API JSON, webhook payloads) and therefore must keep RAW
@@ -495,7 +569,17 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
-        return None
+        # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
+        # compression progress statuses through to chat platforms. The
+        # membership check is derived from the #69550 template constants, so
+        # non-compression noise (aux failures, provider retry chatter, ...)
+        # stays suppressed even when the gate is open. Default False keeps
+        # the silent-by-design behavior byte-identical.
+        if not (
+            _gateway_compression_progress_notices_enabled()
+            and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
+        ):
+            return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
     return text
@@ -2024,7 +2108,11 @@ from gateway.session import (
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
 )
-from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
+from gateway.delivery import (
+    DeliveryRouter,
+    looks_like_telegram_private_chat_id,
+    resolve_delivery_transport,
+)
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
@@ -3514,6 +3602,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from hermes_cli.config import load_config as _load_full_config
                 _sess_cfg = (_load_full_config().get("sessions") or {})
+                # Non-destructive stale-session archive, independent of prune.
+                if _sess_cfg.get("auto_archive", False):
+                    self._session_db._db.maybe_auto_archive(
+                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                    )
                 if _sess_cfg.get("auto_prune", False):
                     # Construction-time, before the loop serves traffic; sync DB is fine.
                     self._session_db._db.maybe_auto_prune_and_vacuum(
@@ -3684,7 +3778,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
-            data = json.loads(self._VOICE_MODE_PATH.read_text())
+            data = json.loads(self._VOICE_MODE_PATH.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
@@ -3712,7 +3806,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             self._VOICE_MODE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._VOICE_MODE_PATH.write_text(
-                json.dumps(self._voice_mode, indent=2)
+                json.dumps(self._voice_mode, indent=2), encoding="utf-8"
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
@@ -6862,7 +6956,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         path = _hermes_home / self._STUCK_LOOP_FILE
         try:
-            counts = json.loads(path.read_text()) if path.exists() else {}
+            counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception:
             counts = {}
 
@@ -6892,7 +6986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return 0
 
         try:
-            counts = json.loads(path.read_text())
+            counts = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
@@ -6938,7 +7032,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not path.exists():
             return
         try:
-            counts = json.loads(path.read_text())
+            counts = json.loads(path.read_text(encoding="utf-8"))
             if session_key in counts:
                 del counts[session_key]
                 if counts:
@@ -6970,7 +7064,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # that triggered the /restart command closing its console.
         if sys.platform == "win32":
             import textwrap
-            from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
+            from hermes_cli._subprocess_compat import (
+                windows_detach_flags_without_breakaway,
+                windows_detach_popen_kwargs,
+            )
 
             cmd_argv = [*hermes_cmd, "gateway", "restart"]
             watcher = textwrap.dedent(
@@ -7042,13 +7139,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if watcher_env.get("PYTHONPATH"):
                     pythonpath.append(watcher_env["PYTHONPATH"])
                 watcher_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
-            subprocess.Popen(
-                [watcher_python, "-c", watcher, str(current_pid), str(restart_after_s), *cmd_argv],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=watcher_env,
-                **windows_detach_popen_kwargs(),
-            )
+            watcher_argv = [
+                watcher_python,
+                "-c",
+                watcher,
+                str(current_pid),
+                str(restart_after_s),
+                *cmd_argv,
+            ]
+            # The watcher process must itself break away from any job object the
+            # parent CLI lives in (Electron/Tauri-wrapped Hermes Desktop, Windows
+            # Terminal, schtasks shells); otherwise it is reaped when the CLI
+            # exits and the gateway never respawns.  windows_detach_popen_kwargs()
+            # carries CREATE_BREAKAWAY_FROM_JOB, but a restrictive job object
+            # (no JOB_OBJECT_LIMIT_BREAKAWAY_OK) rejects that bit with
+            # ERROR_ACCESS_DENIED, surfaced as OSError.  Retry once without the
+            # breakaway bit, preserving argv and the scrubbed watcher_env.
+            # Mirrors the canonical fallback in
+            # hermes_cli/gateway_windows.py::_spawn_detached.
+            try:
+                subprocess.Popen(
+                    watcher_argv,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=watcher_env,
+                    **windows_detach_popen_kwargs(),
+                )
+            except OSError:
+                try:
+                    subprocess.Popen(
+                        watcher_argv,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=watcher_env,
+                        creationflags=windows_detach_flags_without_breakaway(),
+                    )
+                except OSError as exc:
+                    # Both spawn attempts failed (a breakaway-denying job object
+                    # is the common cause, but OSError covers others too).
+                    # Record a minimal, path-safe diagnostic and return without
+                    # crashing the caller: state plainly that no watcher was
+                    # started, and log only the interpreter basename and a
+                    # numeric error code — never argv, env, watcher source, or
+                    # str(exc) (which can carry a full interpreter path for a
+                    # FileNotFoundError).
+                    winerror = getattr(exc, "winerror", None)
+                    error_code = winerror if winerror is not None else exc.errno
+                    error_field = "winerror" if winerror is not None else "errno"
+                    logger.warning(
+                        "Detached restart watcher was not started after the "
+                        "no-breakaway retry (%s; %s=%r). The gateway will not "
+                        "be respawned by this restart attempt.",
+                        os.path.basename(watcher_python),
+                        error_field,
+                        error_code,
+                    )
             return
 
         cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
@@ -7126,7 +7271,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     out = subprocess.run(
                         [systemctl, *scope_flags, "show", service_name,
                          "--property=MainPID", "--value"],
-                        capture_output=True, text=True, timeout=2,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2,
                     )
                     return (out.stdout or "").strip()
                 except Exception:
@@ -10629,7 +10774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt_path = _hermes_home / ".update_prompt.json"
                 try:
                     tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text(response_text)
+                    tmp.write_text(response_text, encoding="utf-8")
                     tmp.replace(response_path)
                     prompt_path.unlink(missing_ok=True)
                 except OSError as e:
@@ -10649,7 +10794,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt_path = _hermes_home / ".update_prompt.json"
                 try:
                     tmp = response_path.with_suffix(".tmp")
-                    tmp.write_text("")
+                    tmp.write_text("", encoding="utf-8")
                     tmp.replace(response_path)
                     prompt_path.unlink(missing_ok=True)
                     logger.info(
@@ -10855,6 +11000,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "egress":
+                from hermes_cli.proxy_cli import format_status_text
+
+                return format_status_text()
 
             # /stop must hard-kill the session when an agent is running.
             # A soft interrupt (agent.interrupt()) doesn't help when the agent
@@ -11391,6 +11541,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "egress":
+            from hermes_cli.proxy_cli import format_status_text
+
+            return format_status_text()
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -13915,7 +14070,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # large to process.  Auto-reset it so the next message starts
             # fresh instead of replaying the same oversized context in an
             # infinite fail loop.  (#9893)
-            if agent_result.get("compression_exhausted") and session_entry and session_key:
+            #
+            # A lock-contended defer is the OPPOSITE case: the session is
+            # temporarily uncompressible only because a concurrent path holds
+            # the compression lock and is actively shrinking it. Never wipe
+            # the session for that — retry-next-message semantics apply
+            # (#69870 lock-skip consumer; salvaged from #49874).
+            if agent_result.get("compression_deferred"):
+                logger.info(
+                    "Compression deferred for session %s — the compression "
+                    "lock is held by a concurrent compressor. Keeping the "
+                    "session intact; the next message retries normally.",
+                    session_entry.session_id if session_entry else "?",
+                )
+            elif agent_result.get("compression_exhausted") and session_entry and session_key:
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
@@ -14575,7 +14743,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._booted_from_restart = False
                     return True
                 return False
-            data = json.loads(marker_path.read_text())
+            data = json.loads(marker_path.read_text(encoding="utf-8"))
         except Exception:
             return False
 
@@ -16529,7 +16697,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for path in (claimed_path, pending_path):
             if path.exists():
                 try:
-                    pending = json.loads(path.read_text())
+                    pending = json.loads(path.read_text(encoding="utf-8"))
                     platform_str = pending.get("platform")
                     chat_id = pending.get("chat_id")
                     chat_type = pending.get("chat_type")
@@ -16568,7 +16736,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 await asyncio.sleep(poll_interval)
             if (pending_path.exists() or claimed_path.exists()) and not exit_code_path.exists():
-                exit_code_path.write_text("124")
+                exit_code_path.write_text("124", encoding="utf-8")
                 await self._send_update_notification()
             return
 
@@ -16610,7 +16778,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Read any remaining output
                 if output_path.exists():
                     try:
-                        content = output_path.read_text()
+                        content = output_path.read_text(encoding="utf-8")
                         if len(content) > bytes_sent:
                             buffer += content[bytes_sent:]
                             bytes_sent = len(content)
@@ -16620,7 +16788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # Send final status
                 try:
-                    exit_code_raw = exit_code_path.read_text().strip() or "1"
+                    exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
                     exit_code = int(exit_code_raw)
                     if exit_code == 0:
                         await adapter.send(
@@ -16649,7 +16817,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check for new output
             if output_path.exists():
                 try:
-                    content = output_path.read_text()
+                    content = output_path.read_text(encoding="utf-8")
                     if len(content) > bytes_sent:
                         buffer += content[bytes_sent:]
                         bytes_sent = len(content)
@@ -16667,7 +16835,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (prompt_path.exists() and session_key
                     and not self._update_prompt_pending.get(session_key)):
                 try:
-                    prompt_data = json.loads(prompt_path.read_text())
+                    prompt_data = json.loads(prompt_path.read_text(encoding="utf-8"))
                     prompt_text = prompt_data.get("prompt", "")
                     default = prompt_data.get("default", "")
                     if prompt_text:
@@ -16715,7 +16883,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Timeout
         if not exit_code_path.exists():
             logger.warning("Update watcher timed out after %.0fs", timeout)
-            exit_code_path.write_text("124")
+            exit_code_path.write_text("124", encoding="utf-8")
             await _flush_buffer()
             try:
                 await adapter.send(
@@ -16761,7 +16929,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             elif not claimed_path.exists():
                 return True
 
-            pending = json.loads(claimed_path.read_text())
+            pending = json.loads(claimed_path.read_text(encoding="utf-8"))
             platform_str = pending.get("platform")
             chat_id = pending.get("chat_id")
             chat_type = pending.get("chat_type")
@@ -16775,13 +16943,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 claimed_path.replace(pending_path)
                 return False
 
-            exit_code_raw = exit_code_path.read_text().strip() or "1"
+            exit_code_raw = exit_code_path.read_text(encoding="utf-8").strip() or "1"
             exit_code = int(exit_code_raw)
 
             # Read the captured update output
             output = ""
             if output_path.exists():
-                output = output_path.read_text()
+                output = output_path.read_text(encoding="utf-8")
 
             # Resolve adapter
             platform = Platform(platform_str)
@@ -16856,7 +17024,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         try:
-            data = json.loads(notify_path.read_text())
+            data = json.loads(notify_path.read_text(encoding="utf-8"))
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             chat_type = data.get("chat_type")
@@ -16867,10 +17035,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
-            if not adapter:
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
                 logger.debug(
-                    "Restart notification skipped: %s adapter not connected",
+                    "Restart notification skipped: no live transport for %s",
                     platform_str,
                 )
                 return None
@@ -16889,9 +17057,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id,
                 chat_type=chat_type,
                 reply_to_message_id=message_id,
-                adapter=adapter,
+                adapter=transport.adapter,
             )
-            result = await adapter.send(
+            if data.get("delivered_via_upstream_relay") is True:
+                metadata = dict(metadata or {})
+                if data.get("user_id"):
+                    metadata["user_id"] = str(data["user_id"])
+                if data.get("scope_id"):
+                    metadata["scope_id"] = str(data["scope_id"])
+            result = await transport.send(
+                platform,
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",
                 metadata=_non_conversational_metadata(metadata, platform=platform),
@@ -16936,13 +17111,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
-        for platform, adapter in self.adapters.items():
-            home = self.config.get_home_channel(platform)
+        for platform, platform_cfg in self.config.platforms.items():
+            home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
+            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            if transport is None:
+                continue
+
+            if not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",
                     platform.value,
@@ -16958,24 +17136,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform,
                     home.chat_id,
                     home.thread_id,
-                    adapter=adapter,
+                    adapter=transport.adapter,
                 )
-                if metadata:
-                    result = await adapter.send(
+                if transport.is_relay:
+                    metadata = dict(metadata or {})
+                    if home.user_id:
+                        metadata["user_id"] = home.user_id
+                    if home.scope_id:
+                        metadata["scope_id"] = home.scope_id
+                send_metadata = _non_conversational_metadata(metadata, platform=platform)
+                if send_metadata is not None or transport.is_relay:
+                    result = await transport.send(
+                        platform,
                         str(home.chat_id),
                         message,
-                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                        metadata=send_metadata,
                     )
                 else:
-                    _startup_meta = _non_conversational_metadata(platform=platform)
-                    if _startup_meta:
-                        result = await adapter.send(
-                            str(home.chat_id),
-                            message,
-                            metadata=_startup_meta,
-                        )
-                    else:
-                        result = await adapter.send(str(home.chat_id), message)
+                    result = await transport.adapter.send(str(home.chat_id), message)
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
@@ -18102,6 +18280,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("model", "context_length"),
         ("model", "max_tokens"),
         ("compression", "enabled"),
+        ("compression", "progress_notices"),
         ("compression", "threshold"),
         ("compression", "model_thresholds"),
         ("compression", "threshold_tokens"),
@@ -18109,6 +18288,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "codex_app_server_auto"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("compression", "proactive_prune_tokens"),
+        ("compression", "proactive_prune_min_result_chars"),
+        ("compression", "proactive_prune_min_reclaim_tokens"),
+        ("compression", "min_tail_user_messages"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),
@@ -22006,6 +22189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
+                    "compression_deferred": result.get("compression_deferred", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": _effective_history_offset,
                     "compacted_in_place": _compacted_in_place,
@@ -22123,6 +22307,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
+                # Soft lock-contention defer (#69870 consumer): distinct from
+                # compression_exhausted so the gateway never auto-resets a
+                # session that a concurrent compressor is about to shrink.
+                "compression_deferred": (
+                    result_holder[0].get("compression_deferred", False)
+                    if result_holder[0] else False
+                ),
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "compacted_in_place": _compacted_in_place,
@@ -23209,6 +23400,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    AUTO_ARCHIVE_EVERY = 60  # ticks — poll hourly (state_meta gate owns the real cadence)
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
@@ -23272,6 +23464,28 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                 )
             except Exception as e:
                 logger.debug("Curator tick error: %s", e)
+
+        # Stale-session auto-archive — a live timer, so gateways that stay up
+        # for weeks keep sweeping on schedule (the startup hook fires once).
+        # maybe_auto_archive() is gated by sessions.min_interval_hours in
+        # state_meta; this is just the poll rate. Opens its own SessionDB —
+        # SQLite connections are thread-bound and this runs off-loop.
+        if tick_count % AUTO_ARCHIVE_EVERY == 0:
+            try:
+                from hermes_cli.config import load_config as _load_full_config
+                from hermes_state import SessionDB
+                _sess_cfg = (_load_full_config().get("sessions") or {})
+                if _sess_cfg.get("auto_archive", False):
+                    _adb = SessionDB()
+                    try:
+                        _adb.maybe_auto_archive(
+                            idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+                            min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        )
+                    finally:
+                        _adb.close()
+            except Exception as e:
+                logger.debug("Auto-archive tick error: %s", e)
 
         stop_event.wait(timeout=interval)
     logger.info("Gateway housekeeping stopped")
@@ -23822,7 +24036,35 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+
+    # Multiplex profiles: tell the built-in ticker which profile homes to
+    # tick so secondary-profile cron jobs actually fire (#69377).
+    # Without this, only the process-global HERMES_HOME (default profile)
+    # is iterated and every secondary profile's cron store is silently
+    # ignored — jobs show as "scheduled" with a valid next_run_at but
+    # never execute because no ticker owns that store.
+    if (
+        isinstance(cron_provider, InProcessCronScheduler)
+        and getattr(runner.config, "multiplex_profiles", False)
+    ):
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            profile_homes = list(profiles_to_serve(multiplex=True))
+            if profile_homes:
+                cron_start_kwargs["profile_homes"] = profile_homes
+                logger.info(
+                    "Cron scheduler will tick %d profile(s) under multiplex: %s",
+                    len(profile_homes),
+                    [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve profile homes for multiplex cron: %s",
+                exc,
+            )
+
     # External cron providers own their remote scheduling contract. Only the
     # in-process ticker polls local due jobs, so only it receives the local
     # external-drain dispatch gate.

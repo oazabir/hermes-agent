@@ -29,9 +29,69 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
+from hermes_cli.sqlite_runtime import (
+    is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
+)
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
+try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
+    import psutil
+except ImportError:  # pragma: no cover - stripped/scaffold installs only
+    psutil = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
+
+_COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
+
+
+def _compression_lock_holder_process_is_dead(holder: str) -> bool:
+    """Return True only when a structured lock holder's local PID is gone.
+
+    Compression locks are stored in a host-local SQLite database and holder
+    IDs created by ``conversation_compression`` start with ``pid=<n>``. A
+    process killed during gateway shutdown cannot release its lease, so waiting
+    for the full TTL makes every new turn repeatedly attempt compaction. Reclaim
+    only when the kernel proves that PID no longer exists; legacy/unstructured
+    holders, same-process holders, permission errors, and any probe doubt
+    remain protected until normal TTL expiry (conservative: PID reuse must
+    never steal a live lease, and a wrongly-kept lease self-heals via TTL).
+    """
+    # Windows stays TTL-only: stdlib os.kill(pid, 0) is NOT a no-op probe
+    # there (bpo-14484 — sig=0 maps to CTRL_C_EVENT and can kill the target's
+    # console group), and PID recycling semantics make liveness a weaker
+    # deadness signal. The 300s lease TTL remains the recovery path.
+    if os.name == "nt":
+        return False
+    match = _COMPRESSION_LOCK_HOLDER_PID_RE.search(holder or "")
+    if match is None:
+        return False
+    try:
+        pid = int(match.group(1))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        # Same-process holder (e.g. another thread's live lease): never
+        # self-reclaim — the lease refresher and release path own it.
+        return False
+    if psutil is not None:
+        try:
+            # psutil is the canonical cross-platform liveness answer
+            # (CONTRIBUTING.md "Critical rules" #1). pid_exists() reports
+            # recycled PIDs as alive — conservative, the TTL still applies.
+            return not psutil.pid_exists(pid)
+        except Exception:
+            return False  # any doubt → keep the lease until TTL expiry
+    # Scaffold-phase fallback only (psutil missing). POSIX-only by the
+    # os.name gate above.
+    try:
+        os.kill(pid, 0)  # windows-footgun: ok — function early-returns on nt above
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError, OverflowError):
+        return False
+    return False
 
 
 def _scrub_surrogates(value: Any) -> Any:
@@ -434,16 +494,7 @@ def is_sqlite_wal_reset_vulnerable(
     Pre-WAL libraries (< 3.7.0) cannot hit the race and are treated as safe.
     """
     info = version_info if version_info is not None else sqlite3.sqlite_version_info
-    if info < (3, 7, 0):
-        return False
-    if info >= (3, 51, 3):
-        return False
-    # Backports of the same fix on older release lines.
-    if (3, 50, 7) <= info < (3, 51, 0):
-        return False
-    if (3, 44, 6) <= info < (3, 45, 0):
-        return False
-    return True
+    return _is_sqlite_wal_reset_vulnerable(info)
 
 
 def sqlite_source_id() -> str:
@@ -582,9 +633,9 @@ def _log_wal_reset_bug_once(
         "%s: linked SQLite %s is vulnerable to the WAL-reset corruption "
         "bug (https://sqlite.org/wal.html#walresetbug) — %s. "
         "Upgrade to SQLite 3.51.3+ (or backports 3.50.7 / 3.44.6); "
-        "`hermes update` alone may not change python-build-standalone's "
-        "embedded SQLite. See `hermes doctor`. This warning fires once "
-        "per process per database.",
+        "Hermes-managed installs can repair the embedded runtime with "
+        "`hermes update`. See `hermes doctor`. This warning fires once per "
+        "process per database.",
         db_label,
         sqlite3.sqlite_version,
         action,
@@ -1044,6 +1095,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     profile_name TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    pinned INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -3330,13 +3382,15 @@ class SessionDB:
 
         When ``parent_session_id`` is set (compression fork, delegate/subagent
         spawn, branch continuation) and this row's own ``cwd``/``git_repo_root``/
-        ``git_branch`` are still NULL after the insert, they are backfilled from
-        the parent row. Callers of ``create_session`` for a child session
-        historically didn't propagate these fields themselves (e.g. the
+        ``git_branch``/``profile_name`` are still NULL after the insert, they are
+        backfilled from the parent row. Callers of ``create_session`` for a child
+        session historically didn't propagate these fields themselves (e.g. the
         compression-fork path), so a lineage could silently lose its working
         directory and drop out of the project sidebar every time it forked
-        (#64709). This only fills NULLs — an explicit ``cwd``/``git_repo_root``
-        on the child is never overwritten. For compression forks specifically
+        (#64709), or lose its owning profile and be aggregated as "default" every
+        time it rotated or branched (the cross-profile session-jump bug). This
+        only fills NULLs — an explicit value on the child is never overwritten.
+        For compression forks specifically
         (parent ended with ``end_reason='compression'``), the gateway origin
         columns (``user_id``/``session_key``/``chat_id``/``chat_type``/
         ``thread_id``/``display_name``/``origin_json``) are inherited too, so a
@@ -3392,7 +3446,10 @@ class SessionDB:
                                              WHERE p.id = sessions.parent_session_id)),
                            git_branch = COALESCE(sessions.git_branch,
                                         (SELECT p.git_branch FROM sessions p
-                                          WHERE p.id = sessions.parent_session_id))
+                                          WHERE p.id = sessions.parent_session_id)),
+                           profile_name = COALESCE(sessions.profile_name,
+                                          (SELECT p.profile_name FROM sessions p
+                                            WHERE p.id = sessions.parent_session_id))
                      WHERE id = ? AND parent_session_id IS NOT NULL""",
                     (session_id,),
                 )
@@ -4152,10 +4209,10 @@ class SessionDB:
         MUST NOT proceed with compression in that case (its rotation would
         race against the holder's, splitting the session lineage).
 
-        Expired locks (``expires_at < now``) are reclaimed transparently:
-        the stale row is deleted and the new holder acquires it. This
-        prevents a crashed compressor from permanently blocking the
-        session.
+        Expired locks (``expires_at < now``) are reclaimed transparently.
+        Structured holders whose local ``pid=`` no longer exists are reclaimed
+        immediately, so a gateway killed during compression does not stall the
+        replacement process for the full lease TTL.
 
         Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
         followed by a SELECT to confirm we got the row. SQLite serialises
@@ -4167,12 +4224,29 @@ class SessionDB:
         expires_at = now + ttl_seconds
 
         def _do(conn):
-            # First: reclaim any expired lock for this session_id.
-            conn.execute(
-                "DELETE FROM compression_locks "
-                "WHERE session_id = ? AND expires_at < ?",
-                (session_id, now),
-            )
+            reclaimed_holder = None
+            row = conn.execute(
+                "SELECT holder, expires_at FROM compression_locks "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is not None:
+                current_holder = (
+                    row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+                )
+                current_expires_at = (
+                    row["expires_at"] if isinstance(row, sqlite3.Row) else row[1]
+                )
+                if (
+                    current_expires_at < now
+                    or _compression_lock_holder_process_is_dead(current_holder)
+                ):
+                    conn.execute(
+                        "DELETE FROM compression_locks "
+                        "WHERE session_id = ? AND holder = ?",
+                        (session_id, current_holder),
+                    )
+                    reclaimed_holder = current_holder
             # Then: try to insert. INSERT OR IGNORE returns no rowcount
             # difference — verify ownership via SELECT.
             conn.execute(
@@ -4185,12 +4259,21 @@ class SessionDB:
                 "SELECT holder FROM compression_locks WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
-            return row is not None and (
+            acquired = row is not None and (
                 row["holder"] if isinstance(row, sqlite3.Row) else row[0]
             ) == holder
+            return acquired, reclaimed_holder
 
         try:
-            return bool(self._execute_write(_do))
+            acquired, reclaimed_holder = self._execute_write(_do)
+            if reclaimed_holder:
+                logger.warning(
+                    "Reclaimed stale compression lock for session=%s "
+                    "(holder=%s)",
+                    session_id,
+                    reclaimed_holder,
+                )
+            return bool(acquired)
         except sqlite3.Error as exc:
             logger.warning(
                 "try_acquire_compression_lock(%s) failed: %s",
@@ -4277,11 +4360,78 @@ class SessionDB:
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
+        Also nulls ``system_prompt`` so stale ``Model:`` / ``Provider:``
+        footer metadata is rebuilt on the next turn. A successful /model
+        switch explicitly replaces any confirmed Browser runtime lock while
+        preserving unrelated lineage markers in ``model_config``.
         """
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET model = ? WHERE id = ?",
+                """UPDATE sessions SET
+                   model = ?,
+                   model_config = CASE
+                       WHEN model_config IS NULL THEN NULL
+                       WHEN json_valid(model_config)
+                           THEN json_remove(model_config, '$.browser_model_lock')
+                       ELSE model_config
+                   END,
+                   system_prompt = NULL
+                   WHERE id = ?""",
                 (model, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_session_runtime_lock(
+        self,
+        session_id: str,
+        *,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
+        route_source: Optional[str] = None,
+        confirmed: bool = False,
+    ) -> None:
+        """Persist a Browser / API client runtime lock without clobbering lineage markers.
+
+        Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
+        ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
+        so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+        """
+        lock = {
+            "provider": provider or "",
+            "model": model or "",
+            "model_options": model_options or {},
+            "route_source": route_source or "",
+            "confirmed": bool(confirmed),
+            "updated_at": time.time(),
+        }
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except Exception:
+                    config = {}
+            elif isinstance(raw, dict):
+                config = dict(raw)
+            config["browser_model_lock"] = lock
+            conn.execute(
+                """UPDATE sessions SET
+                   model_config = ?,
+                   model = COALESCE(?, model),
+                   system_prompt = NULL
+                   WHERE id = ?""",
+                (json.dumps(config), model, session_id),
             )
         self._execute_write(_do)
 
@@ -4978,6 +5128,58 @@ class SessionDB:
                 WHERE id IN (SELECT id FROM lineage)
                 """,
                 (session_id, session_id, 1 if archived else 0),
+            )
+            rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+        rowcount = self._execute_write(_do)
+        return rowcount > 0
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        """Pin or unpin a session (and its whole compression lineage).
+
+        ``pinned`` is a durable "keep" flag: pinned sessions are exempt from
+        the ``sessions.auto_archive`` stale sweep (see
+        :meth:`archive_stale_sessions`). Desktop is the current writer — its
+        sidebar pins mirror here so a backend/other-surface sweep honours
+        them. Like :meth:`set_session_archived` the whole compression chain is
+        flipped as a unit, so pinning the surfaced tip protects the root (and
+        vice-versa) no matter which id the caller holds. Returns True when at
+        least one row changed.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET pinned = ?
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                (session_id, session_id, 1 if pinned else 0),
             )
             rowcount = cursor.rowcount
             if rowcount is None or rowcount < 0:
@@ -8944,6 +9146,55 @@ class SessionDB:
             self.set_session_archived(row["id"], True)
         return len(rows)
 
+    def archive_stale_sessions(
+        self, idle_days: float, *, exclude_pinned: bool = True
+    ) -> int:
+        """Archive every session untouched for at least ``idle_days`` days.
+
+        "Touched" is the latest message timestamp (falling back to
+        ``started_at``) — i.e. real recency, not creation time — so a session
+        created long ago but active yesterday is spared, while an old
+        abandoned one (even a still-open one) is swept. This differs from
+        :meth:`archive_sessions`, which ages on ``started_at`` and only ended
+        sessions.
+
+        Guards:
+          * ``pinned = 0`` when ``exclude_pinned`` (the Desktop "keep" flag).
+          * ``archived = 0`` so repeat runs are idempotent no-ops.
+          * only lineage *tips* / standalone rows are candidates
+            (``end_reason <> 'compression'``); a stale tip archives its whole
+            chain via :meth:`set_session_archived`, so we never resurrect an
+            active conversation by matching an old compressed-away root whose
+            live continuation is recent.
+
+        Returns the number of sessions archived. Never raises for an empty or
+        non-positive ``idle_days`` — it simply archives nothing.
+        """
+        if idle_days is None or idle_days < 0:
+            return 0
+        cutoff = time.time() - float(idle_days) * 86400.0
+        pin_clause = "AND s.pinned = 0" if exclude_pinned else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT s.id FROM sessions s
+                WHERE s.archived = 0
+                  AND COALESCE(s.end_reason, '') <> 'compression'
+                  {pin_clause}
+                  AND COALESCE(
+                        (SELECT MAX(m.timestamp) FROM messages m
+                         WHERE m.session_id = s.id),
+                        s.started_at
+                      ) < ?
+                ORDER BY s.started_at ASC
+                """,
+                (cutoff,),
+            ).fetchall()
+        ids = [(r["id"] if isinstance(r, sqlite3.Row) else r[0]) for r in rows]
+        for sid in ids:
+            self.set_session_archived(sid, True)
+        return len(ids)
+
     def prune_sessions(
         self,
         older_than_days: Optional[float] = 90,
@@ -9757,6 +10008,59 @@ class SessionDB:
         except Exception as exc:
             # Maintenance must never block startup. Log and return error marker.
             logger.warning("state.db auto-maintenance failed: %s", exc)
+            result["error"] = str(exc)
+
+        return result
+
+    def maybe_auto_archive(
+        self,
+        idle_days: float = 3,
+        min_interval_hours: int = 24,
+        exclude_pinned: bool = True,
+    ) -> Dict[str, Any]:
+        """Idempotent auto-archive: soft-hide sessions idle for ``idle_days``.
+
+        Sibling of :meth:`maybe_auto_prune_and_vacuum` but non-destructive —
+        it archives (hides) rather than deletes, and ages on last activity
+        (see :meth:`archive_stale_sessions`) rather than creation. Records the
+        last run in ``state_meta['last_auto_archive']`` so calls within
+        ``min_interval_hours`` no-op; safe to call opportunistically (startup
+        hooks, or when the Desktop backend lists sessions).
+
+        Never raises. Returns a dict with:
+          - ``"skipped"`` (bool) — within min_interval_hours of last run
+          - ``"archived"`` (int) — sessions archived this run
+          - ``"error"`` (str, optional) — present only on failure
+        """
+        result: Dict[str, Any] = {"skipped": False, "archived": 0}
+        try:
+            last_raw = self.get_meta("last_auto_archive")
+            now = time.time()
+            if last_raw:
+                try:
+                    if now - float(last_raw) < min_interval_hours * 3600:
+                        result["skipped"] = True
+                        return result
+                except (TypeError, ValueError):
+                    pass  # corrupt meta; treat as no prior run
+
+            archived = self.archive_stale_sessions(
+                idle_days, exclude_pinned=exclude_pinned
+            )
+            result["archived"] = archived
+
+            # Record even a zero-archive run so we don't re-sweep every call
+            # within the interval window.
+            self.set_meta("last_auto_archive", str(now))
+
+            if archived > 0:
+                logger.info(
+                    "state.db auto-archive: archived %d session(s) idle >= %s days",
+                    archived,
+                    idle_days,
+                )
+        except Exception as exc:
+            logger.warning("state.db auto-archive failed: %s", exc)
             result["error"] = str(exc)
 
         return result

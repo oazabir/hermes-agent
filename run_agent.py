@@ -239,6 +239,12 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_pre_verify_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
+    # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
+    # empty tool_calls array): the interim narration-only assistant turn
+    # and the "issue the actual tool call now" user nudge exist only to
+    # drive the bounded retry. Persisting them would replay the internal
+    # retry instruction as user-authored context on resume.
+    "_dropped_toolcall_nudge",
 )
 
 
@@ -4963,6 +4969,7 @@ class AIAgent:
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
 
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(

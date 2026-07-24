@@ -355,6 +355,24 @@ def _emit_compression_attempt_telemetry(
         logger.debug("failed to emit compression attempt telemetry: %s", exc)
 
 
+def compression_skipped_due_to_lock(agent: Any) -> bool:
+    """Type-pinned read of the #69870 lock-skip signal.
+
+    ``agent._compression_skipped_due_to_lock`` is set by ``compress_context``
+    when a compression pass no-ops because another path holds the per-session
+    compression lock (holder string when the holder was confirmed, ``True``
+    otherwise) and cleared to ``None`` at the entry of every call.
+
+    The read MUST be type-pinned (``is True or isinstance(x, str)``), never
+    bare truthiness: MagicMock test-double agents auto-create truthy
+    attributes, and a bare ``if getattr(agent, ...)`` would hijack every
+    mocked agent in sibling suites into the lock-skip branch (the
+    #69870 × #69840 type-ahead incident).
+    """
+    _sig = getattr(agent, "_compression_skipped_due_to_lock", None)
+    return _sig is True or isinstance(_sig, str)
+
+
 def _compression_lock_holder(agent: Any) -> str:
     """Build a unique holder id for the lock: pid:tid:agent-instance:uuid.
 
@@ -874,6 +892,7 @@ _SYNTHETIC_USER_FLAGS = (
     "_empty_recovery_synthetic",
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_dropped_toolcall_nudge",
 )
 
 
@@ -1143,6 +1162,14 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    # Clear the lock-skip signal at the VERY TOP, before the codex route and
+    # the breaker gates below can early-return (per-attempt state rule,
+    # #58630/#69853). A stale ``True``/holder value from a prior lock-skip
+    # must never make a later breaker/codex no-op look like lock contention
+    # to the automatic-path consumers (compression_deferred, #49874) — the
+    # second clear before lock acquisition below stays for the same reason
+    # it was added in #69870 and is simply idempotent now.
+    agent._compression_skipped_due_to_lock = None
 
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
@@ -1882,6 +1909,19 @@ def compress_context(
                     except Exception:
                         pass
                     agent._session_db_created = False
+                    # The rotation child must stay on the parent's profile —
+                    # mirror _ensure_db_session's stamp ("default" persists as
+                    # NULL). _insert_session_row's parent backfill additionally
+                    # COALESCEs from the parent row, covering app-global remote
+                    # sessions whose thread lacks the HERMES_HOME context.
+                    try:
+                        from hermes_cli.profiles import get_active_profile_name
+
+                        _profile_for_child = get_active_profile_name()
+                        if _profile_for_child == "default":
+                            _profile_for_child = None
+                    except Exception:
+                        _profile_for_child = None
                     try:
                         agent._session_db.create_session(
                             session_id=agent.session_id,
@@ -1889,6 +1929,7 @@ def compress_context(
                             model=agent.model,
                             model_config=agent._session_init_model_config,
                             parent_session_id=old_session_id,
+                            profile_name=_profile_for_child,
                         )
                     except Exception as _cs_err:
                         # The child row could not be created (e.g. FK constraint,

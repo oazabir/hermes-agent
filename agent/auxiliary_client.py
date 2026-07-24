@@ -1058,16 +1058,29 @@ class _CodexCompletionsAdapter:
         # key in extra_body (not top-level) and GitHub/Copilot Responses opts
         # out of cache-key routing entirely — for those hosts, skip it here.
         try:
-            from agent.transports.codex import _content_cache_key
+            from agent.transports.codex import (
+                _content_cache_key,
+                _default_prompt_cache_retention_for_request,
+            )
             from utils import base_url_host_matches
 
             _host_src = str(getattr(self._client, "base_url", "") or "")
             _is_xai = base_url_host_matches(_host_src, "x.ai") or base_url_host_matches(_host_src, "api.x.ai")
-            _is_github = base_url_host_matches(_host_src, "githubcopilot.com")
+            _is_github = (
+                base_url_host_matches(_host_src, "githubcopilot.com")
+                or base_url_host_matches(_host_src, "models.github.ai")
+            )
             if not _is_xai and not _is_github and "prompt_cache_key" not in resp_kwargs:
                 _cache_key = _content_cache_key(instructions, resp_kwargs.get("tools"))
                 if _cache_key:
                     resp_kwargs["prompt_cache_key"] = _cache_key
+            if "prompt_cache_retention" not in resp_kwargs:
+                _cache_retention = _default_prompt_cache_retention_for_request(
+                    model,
+                    _host_src,
+                )
+                if _cache_retention:
+                    resp_kwargs["prompt_cache_retention"] = _cache_retention
         except Exception:
             logger.debug(
                 "Codex auxiliary: prompt_cache_key derivation skipped", exc_info=True
@@ -3648,6 +3661,7 @@ def _retry_same_provider_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3683,7 +3697,13 @@ def _retry_same_provider_sync(
         extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url,
+        task=task,
     )
+    # Preserve per-request attribution headers (e.g. Copilot's
+    # ``x-initiator: user``) across the rebuilt-client retry — dropping them
+    # here would let a recovery retry silently lose capability gating (#60293).
+    if extra_headers:
+        retry_kwargs["extra_headers"] = dict(extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -3707,6 +3727,7 @@ async def _retry_same_provider_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3742,7 +3763,12 @@ async def _retry_same_provider_async(
         extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url,
+        task=task,
     )
+    # Preserve per-request attribution headers across the rebuilt-client
+    # retry — see the sync variant above (#60293).
+    if extra_headers:
+        retry_kwargs["extra_headers"] = dict(extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -3814,6 +3840,24 @@ def _refresh_provider_credentials(provider: str) -> bool:
 
             creds = resolve_xai_oauth_runtime_credentials(force_refresh=True)
             if not str(creds.get("api_key", "") or "").strip():
+                return False
+            _evict_cached_clients(normalized)
+            return True
+        if normalized == "vertex":
+            # Mirrors run_agent.py's _try_refresh_vertex_client_credentials
+            # for the main conversation loop. Without this branch, an
+            # auxiliary Vertex client (vision, title generation, reflection,
+            # context compression, ...) that 401s on its ~1h token expiry
+            # falls through to the final `return False` below: the stale
+            # client is never evicted from _client_cache (whose cache key
+            # ignores the rotating bearer token), so every subsequent
+            # auxiliary Vertex call keeps 401ing until process restart.
+            from agent.vertex_adapter import get_vertex_config
+
+            token, base_url = get_vertex_config()
+            if not isinstance(token, str) or not token.strip():
+                return False
+            if not isinstance(base_url, str) or not base_url.strip():
                 return False
             _evict_cached_clients(normalized)
             return True
@@ -3930,7 +3974,7 @@ def _call_fallback_candidate_sync(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base)
+        base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
@@ -3947,7 +3991,7 @@ def _call_fallback_candidate_sync(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                    base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
                 try:
                     return _validate_llm_response(
                         retry_client.chat.completions.create(**retry_kwargs), task)
@@ -3996,7 +4040,7 @@ async def _call_fallback_candidate_async(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=fb_base)
+        base_url=fb_base, task=task)
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
@@ -4014,7 +4058,7 @@ async def _call_fallback_candidate_async(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=str(getattr(retry_client, "base_url", "") or fb_base))
+                    base_url=str(getattr(retry_client, "base_url", "") or fb_base), task=task)
                 try:
                     return _validate_llm_response(
                         await retry_client.chat.completions.create(**retry_kwargs), task)
@@ -6776,6 +6820,7 @@ def _build_call_kwargs(
     extra_body: Optional[dict] = None,
     reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None,
+    task: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {
@@ -6830,11 +6875,32 @@ def _build_call_kwargs(
             _provider_norm in {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
+        _is_moa = bool(task) and str(task) == "moa_reference"
+        # Gemini's native generateContent maps max_tokens → maxOutputTokens and,
+        # when it is omitted, applies a fixed 65,535-token ceiling rather than
+        # "the model's full budget" (see gemini_native_adapter.build_gemini_request).
+        # So an explicit cap is both safe and the ONLY way to honor it here —
+        # dropping max_tokens silently makes MoA's reference_max_tokens a no-op
+        # for gemini advisors (they run effectively uncapped).
+        _is_gemini_native = _provider_norm in {
+            "gemini", "google", "google-gemini", "google-ai-studio",
+        }
+        if not _is_gemini_native and _effective_base:
+            try:
+                from agent.gemini_native_adapter import is_native_gemini_base_url
+                _is_gemini_native = is_native_gemini_base_url(_effective_base)
+            except Exception:
+                pass
         if (
             _is_anthropic_compat_endpoint(provider, _effective_base)
             or _is_nvidia_nim
+            or _is_moa
+            or _is_gemini_native
         ):
-            kwargs["max_tokens"] = max_tokens
+            # Use auxiliary_max_tokens_param() so models that require
+            # max_completion_tokens (GPT-5 family, Copilot) get the right
+            # parameter name instead of a hardcoded max_tokens that 400s.
+            kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))
 
     if tools:
         # Defensive dedup: providers like Google Vertex, Azure, and Bedrock
@@ -7066,6 +7132,7 @@ def call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
@@ -7091,6 +7158,9 @@ def call_llm(
         extra_body: Additional request body fields.
         reasoning_config: Optional Hermes reasoning config for direct model calls
               such as MoA reference/aggregator slots.
+        extra_headers: Additional per-request HTTP headers. These override
+            client-level defaults for providers that gate capabilities on
+            request attribution (for example Copilot's ``x-initiator``).
         stream: When True, return the raw SDK streaming iterator instead of a
             validated complete response. The caller is responsible for consuming
             chunks (and for any fallback). Used by the MoA aggregator so its
@@ -7203,7 +7273,9 @@ def call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_base_info or resolved_base_url)
+        base_url=_base_info or resolved_base_url, task=task)
+    if extra_headers:
+        kwargs["extra_headers"] = dict(extra_headers)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
@@ -7457,6 +7529,7 @@ def call_llm(
                     effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
+                    extra_headers=extra_headers,
                 )
 
         # ── Same-provider credential-pool recovery ─────────────────────
@@ -7500,6 +7573,7 @@ def call_llm(
                         effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
                         reasoning_config=reasoning_config,
+                        extra_headers=extra_headers,
                     )
                 except Exception as retry2_err:
                     # The rotated key also hit a quota/auth wall.  Mark it
@@ -7819,7 +7893,7 @@ async def async_call_llm(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_client_base or resolved_base_url)
+        base_url=_client_base or resolved_base_url, task=task)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
