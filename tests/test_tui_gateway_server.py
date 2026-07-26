@@ -94,6 +94,7 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     session_key = "cwd-key"
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     launcher = tmp_path / "apps" / "desktop"
     launcher.mkdir(parents=True)
 
@@ -564,6 +565,100 @@ def _write_profile_cfg(home: Path, cwd: str | None) -> Path:
     cfg = {"terminal": {"cwd": cwd}} if cwd is not None else {}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return home
+
+
+def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
+    """MCP discovery must start under the selected profile's HERMES_HOME."""
+    from hermes_cli import mcp_startup
+    from hermes_constants import get_hermes_home
+    from tui_gateway import entry
+
+    profile_home = tmp_path / "profiles" / "sheepyr"
+    profile_home.mkdir(parents=True)
+
+    (profile_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  bluesky_sheepyr:\n"
+        "    command: test-command\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+    token = set_hermes_home_override(str(profile_home))
+
+    seen = []
+
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_started", False)
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", None)
+    # ensure_mcp_discovery_started flips this module global; monkeypatch it so
+    # the enablement doesn't leak into sibling tests in this file.
+    monkeypatch.setattr(entry, "_mcp_discovery_enabled", False)
+    monkeypatch.setattr(
+        mcp_startup,
+        "_discover_mcp_tools_without_interactive_oauth",
+        lambda: seen.append(str(get_hermes_home())),
+    )
+
+    try:
+        entry.ensure_mcp_discovery_started()
+        thread = mcp_startup._mcp_discovery_thread
+        assert thread is not None
+        thread.join(timeout=2)
+    finally:
+        reset_hermes_home_override(token)
+        mcp_startup._mcp_discovery_thread = None
+        mcp_startup._mcp_discovery_started = False
+
+    assert seen == [str(profile_home)]
+
+
+def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
+    monkeypatch, tmp_path
+):
+    """Agent construction must start MCP discovery under the selected profile."""
+    import threading
+
+    from hermes_constants import get_hermes_home
+
+    profile_home = tmp_path / "profiles" / "sheepyr"
+    profile_home.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    seen = []
+    built = threading.Event()
+
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: built.set()
+        or type("Agent", (), {"model": "test"})(),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started",
+        lambda: seen.append(str(get_hermes_home())),
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+
+    ready = threading.Event()
+    sid = "test-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "test-key",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert built.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert seen == [str(profile_home)]
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
@@ -1456,10 +1551,22 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "Searching files for resume", "name": "search_files", "role": "tool"},
+        {"context": "resume", "name": "search_files", "role": "tool"},
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
+
+
+def test_tool_ctx_sends_an_arg_preview_not_a_phrased_label():
+    # Clients phrase their own verb around this string: the TUI renders
+    # `Terminal("<ctx>")` and the desktop prepends "Running"/"Ran". Sending a
+    # pre-phrased label made both stutter ("Ran Running sleep 70 + 2 commands")
+    # and stood in for the real command in the desktop's `$` transcript.
+    assert server._tool_ctx("terminal", {"command": 'sleep 70; echo "a"; echo "b"'}) == (
+        "sleep 70 + 2 commands"
+    )
+    assert server._tool_ctx("read_file", {"path": "/tmp/demo/package.json"}) == "package.json"
+    assert server._tool_ctx("web_search", {"query": "weather in NYC"}) == "weather in NYC"
 
 
 def test_history_to_messages_keeps_reasoning_only_assistant_turn():
@@ -4066,9 +4173,13 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     ]
 
 
-def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
-    """Without an explicit workspace, cwd is left null so the session groups
-    under "No workspace" rather than the gateway's launch directory."""
+def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_path):
+    """A terminal session's directory IS its workspace, so the row records it.
+
+    The user cd'd there before running hermes. Leaving it null stranded the row
+    with no cwd and no git_repo_root, so the sidebar could never place the
+    session under its project.
+    """
     created = []
 
     class _FakeDB:
@@ -4085,7 +4196,28 @@ def test_ensure_session_db_row_defaults_to_no_workspace(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": None}
+        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+    ]
+
+
+def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp_path):
+    """The desktop launches from wherever the bundle was opened, so an unpicked
+    cwd is an artifact — those chats stay null and group under "No workspace"."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, source=None, model=None, model_config=None, parent_session_id=None, cwd=None, profile_name=None):
+            created.append(
+                {"key": key, "source": source, "model": model, "model_config": model_config, "cwd": cwd}
+            )
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
+
+    assert created == [
+        {"key": "k1", "source": "desktop", "model": "test-model", "model_config": None, "cwd": None}
     ]
 
 
@@ -10675,12 +10807,14 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
 # ── verification.status ──────────────────────────────────────────────
 
 
-def test_verification_status_returns_recorded_evidence(tmp_path):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    token = set_hermes_home_override(home)
+def test_verification_status_returns_recorded_evidence(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "verify"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "verify" else None)
+    token = set_hermes_home_override(profile_home)
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     (project / "package.json").write_text(
         json.dumps({"scripts": {"test": "vitest"}}),
         encoding="utf-8",
@@ -10701,7 +10835,7 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
             {
                 "id": "1",
                 "method": "verification.status",
-                "params": {"cwd": str(project), "session_id": "sid"},
+                "params": {"cwd": str(project), "session_id": "sid", "profile": "verify"},
             }
         )
     finally:
@@ -11631,22 +11765,22 @@ def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):
 
 def test_make_agent_nested_max_turns_takes_priority(monkeypatch):
     _setup_make_agent_mocks(
-        monkeypatch, {"agent": {"max_turns": 500}, "max_turns": 100}
+        monkeypatch, {"agent": {"max_turns": 400}, "max_turns": 100}
     )
 
     with patch("run_agent.AIAgent") as mock_agent:
         server._make_agent("sid1", "key1")
 
-    assert mock_agent.call_args.kwargs["max_iterations"] == 500
+    assert mock_agent.call_args.kwargs["max_iterations"] == 400
 
 
-def test_make_agent_defaults_to_90(monkeypatch):
+def test_make_agent_defaults_to_500(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
 
     with patch("run_agent.AIAgent") as mock_agent:
         server._make_agent("sid1", "key1")
 
-    assert mock_agent.call_args.kwargs["max_iterations"] == 90
+    assert mock_agent.call_args.kwargs["max_iterations"] == 500
 
 
 def test_make_agent_uses_session_runtime_overrides(monkeypatch):

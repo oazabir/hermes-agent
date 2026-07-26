@@ -30,14 +30,15 @@ import {
 } from 'electron'
 import nodePty from 'node-pty'
 
+import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
-import { waitForHermesReady } from './backend-health'
+import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
-import { shouldLatchBackendStartFailure } from './backend-start-failure'
+import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
@@ -119,7 +120,13 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { oauthSessionIsLive, resolveJsonBody, resolveOauthRestAuth } from './native-auth-decisions'
+import {
+  oauthGuardMayHardFail,
+  oauthSessionIsLive,
+  resolveJsonBody,
+  resolveOauthRestAuth,
+  resolveReadinessProbeAuth
+} from './native-auth-decisions'
 import {
   nativeRefreshUrl,
   type NativeTokenSet,
@@ -1016,9 +1023,22 @@ let bootstrapFailure = null
 // Latched non-bootstrap backend spawn failure — stops getConnection() from
 // respawning hermes serve backend children in a tight loop while boot is broken.
 let backendStartFailure = null
+// Latched CONFIRMED remote reauth failure. Remote failures deliberately do not
+// latch via backendStartFailure (they're usually transient and must stay
+// retryable), but a rejected session cannot self-heal — and the non-latching
+// path actively breaks recovery: each retry re-emits running:true and hides
+// the boot-failure overlay, so the "Sign in" button flickers away before it
+// can be clicked. Cleared on every recovery path and on a confirmed sign-in.
+let remoteReauthFailure = null
 // Active first-launch install, so the renderer's Cancel button (and app quit)
 // can abort the in-flight install.sh/ps1 instead of leaving it running.
 let bootstrapAbortController = null
+// Explicit "the user asked for a repair" flag. Repair used to signal intent by
+// deleting the bootstrap marker, which stranded healthy installs whose only
+// problem was a transient backend error (#72166). Intent now lives here, so
+// repair can force the installer without destroying provenance about how the
+// install was created. Cleared once the reinstall is under way.
+let bootstrapRepairRequested = false
 let connectionConfigCache = null
 let connectionConfigCacheMtime = null
 const hermesLog = []
@@ -3370,11 +3390,11 @@ function readJson(filePath) {
   }
 }
 
-// Bootstrap-complete marker helpers. The marker is written ONCE by the
-// first-launch bootstrap runner (Phase 1D) after install.ps1 stages succeed
-// AND the user has finished initial configuration. On every subsequent boot
-// we check `isBootstrapComplete()` and skip the bootstrap flow entirely if
-// the marker is present and current-schema.
+// Bootstrap-complete marker helpers. The marker is written by whichever
+// installer ran: install.ps1, install.sh, the Rust bootstrap installer, or the
+// first-launch bootstrap runner. It is provenance ("a bootstrap finished
+// here"), NOT the launch gate -- activeRuntimeState() decides that, because a
+// healthy runtime can predate the marker or outlive a repair that cleared it.
 //
 // Marker schema (version 1):
 //   {
@@ -3407,29 +3427,13 @@ function isActiveRuntimeUsable() {
   )
 }
 
-function isBootstrapComplete() {
-  const marker = readBootstrapMarker()
-
-  if (!marker || typeof marker !== 'object') {
-    return false
-  }
-
-  if (marker.schemaVersion !== BOOTSTRAP_MARKER_SCHEMA_VERSION) {
-    return false
-  }
-
-  if (typeof marker.pinnedCommit !== 'string' || marker.pinnedCommit.length < 7) {
-    return false
-  }
-
+function activeRuntimeState() {
   // We DELIBERATELY do NOT verify that the checkout is currently at the
   // pinned commit -- users update via the in-app update path or `hermes
-  // update`, which moves HEAD legitimately. The marker just attests "we
-  // ran the bootstrap successfully at least once." We DO additionally require
-  // a runnable venv: an interrupted or split-home install can leave the marker
-  // + checkout without a venv, and trusting that spawns a dead backend
-  // ("gateway offline") instead of re-running bootstrap to repair it.
-  return isActiveRuntimeUsable()
+  // update`, which moves HEAD legitimately. The marker only attests "a
+  // desktop-managed bootstrap ran here at least once"; runtime usability is
+  // what decides whether we can actually launch.
+  return classifyActiveRuntime(readBootstrapMarker(), BOOTSTRAP_MARKER_SCHEMA_VERSION, isActiveRuntimeUsable())
 }
 
 function writeBootstrapMarker(payload) {
@@ -3689,14 +3693,28 @@ function resolveHermesBackend(backendArgs) {
     }
   }
 
-  // 3. Bootstrap-complete ACTIVE_HERMES_ROOT -- the canonical install at
-  //    %LOCALAPPDATA%\hermes\hermes-agent (Windows) or ~/.hermes/hermes-agent.
-  //    The bootstrap marker means install.ps1 stages finished and the user
-  //    completed initial configuration; we trust the install and go straight
-  //    to spawning hermes. Updates flow through the in-app update path
-  //    (applyUpdates -> git pull) or `hermes update` from the CLI.
-  if (isBootstrapComplete()) {
+  // 3. ACTIVE_HERMES_ROOT — the canonical install at
+  //    %LOCALAPPDATA%\\hermes\\hermes-agent (Windows) or ~/.hermes/hermes-agent.
+  //    A valid bootstrap marker proves Desktop finished the first-run install
+  //    flow, but marker provenance is NOT the same thing as runtime usability:
+  //    the CLI can create the exact same repo+venv layout, and older desktop
+  //    builds could leave a healthy install behind without the marker. If the
+  //    active runtime is usable, launch it directly; only fall through to
+  //    bootstrap when the runtime itself is unusable.
+  const activeRuntime = activeRuntimeState()
+
+  if (activeRuntime.shouldUseActiveRuntime && !bootstrapRepairRequested) {
+    if (!activeRuntime.hasValidMarker) {
+      rememberLog(
+        `[bootstrap] Active Hermes runtime at ${ACTIVE_HERMES_ROOT} is usable but the bootstrap marker is missing or stale; skipping first-run bootstrap.`
+      )
+    }
+
     return createActiveBackend(backendArgs)
+  }
+
+  if (bootstrapRepairRequested) {
+    rememberLog('[bootstrap] repair requested; bypassing the usable active runtime to re-run the installer')
   }
 
   // 4. Existing `hermes` on PATH -- installed via install.ps1 / install.sh from
@@ -3872,6 +3890,10 @@ async function ensureRuntime(backend) {
 
     bootstrapAbortController = new AbortController()
 
+    // The repair request has been honoured by reaching the installer; clear it
+    // so a later boot isn't forced through bootstrap again.
+    bootstrapRepairRequested = false
+
     const bootstrapResult = await runBootstrap({
       installStamp: backend.installStamp,
       activeRoot: backend.activeRoot,
@@ -3966,10 +3988,10 @@ async function ensureRuntime(backend) {
     // No venv at the expected location AND no bootstrap-needed sentinel
     // means we have a half-installed checkout: .git exists, source files
     // exist, but venv is missing or broken. This shouldn't happen in
-    // normal flow because isBootstrapComplete() requires
-    // isHermesSourceRoot() and the bootstrap writes the marker only after
-    // install.ps1 succeeds. If we hit this, the user (or a deleted venv)
-    // broke the invariant; tell them to re-run the install.
+    // normal flow because activeRuntimeState() requires isHermesSourceRoot()
+    // plus an importable hermes_cli before it hands back the active runtime.
+    // If we hit this, the user (or a deleted venv) broke the invariant; tell
+    // them to re-run the install.
     throw new Error(
       `Hermes venv missing at ${VENV_ROOT}. Re-run the desktop installer or ` + '`scripts/install.ps1` to rebuild it.'
     )
@@ -4815,12 +4837,87 @@ function closePreviewWatchers() {
   }
 }
 
-async function waitForHermes(baseUrl, token, signal?) {
+// Best-effort read of a gateway's advertised auth providers, cached per base
+// URL for the life of the process. Used by the oauth pre-flight guard to tell
+// a password-provider gateway (which cannot satisfy the bearer/cookie checks
+// by design) from a real OAuth one. Any failure returns [] so callers keep the
+// strict guard — backends predating /api/auth/providers are unaffected.
+const gatewayAuthProvidersCache = new Map<string, any[]>()
+
+async function gatewayAuthProviders(baseUrl) {
+  const cached = gatewayAuthProvidersCache.get(baseUrl)
+
+  if (cached) {
+    return cached
+  }
+
+  let providers = []
+
+  try {
+    const body = (await fetchPublicJson(`${baseUrl}/api/auth/providers`, { timeoutMs: 8_000 })) as any
+
+    if (Array.isArray(body?.providers)) {
+      providers = body.providers
+        .filter(p => p && typeof p === 'object')
+        .map(p => ({ name: String(p.name || ''), supportsPassword: Boolean(p.supports_password) }))
+        .filter(p => p.name)
+    }
+  } catch {
+    // Optional metadata — an unreadable list keeps the strict guard.
+  }
+
+  gatewayAuthProvidersCache.set(baseUrl, providers)
+
+  return providers
+}
+
+// Build the readiness probe for a connection's auth mode. A gated gateway
+// must be probed with the SAME credentials the rest of the connection uses:
+// an anonymous probe 401s forever against a live session, and it can never
+// see the 404 that identifies a backend predating /api/health (the auth gate
+// answers before the SPA catch-all). `probeIsCredentialed` tells
+// waitForHermesReady how to read a 401 — rejected session vs gated route.
+async function buildReadinessHealthProbe(baseUrl, authMode, token) {
+  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+  const probeAuth = resolveReadinessProbeAuth(authMode, nativeAt, token)
+
+  if (probeAuth.kind === 'bearer') {
+    return {
+      // fetchJson takes the bearer via `options.bearer` — a raw `headers`
+      // option is ignored, so passing one here would silently probe
+      // uncredentialed and reintroduce the 401 loop.
+      probeHealth: (url, options: any = {}) => fetchJson(url, null, { ...options, bearer: probeAuth.token }),
+      probeIsCredentialed: true
+    }
+  }
+
+  if (probeAuth.kind === 'cookie') {
+    return {
+      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, options),
+      probeIsCredentialed: true
+    }
+  }
+
+  if (probeAuth.kind === 'token' && probeAuth.token) {
+    return {
+      probeHealth: (url, options: any = {}) => fetchJson(url, probeAuth.token, options),
+      probeIsCredentialed: true
+    }
+  }
+
+  return { probeHealth: fetchPublicJson, probeIsCredentialed: false }
+}
+
+async function waitForHermes(baseUrl, token, signal?, authMode?) {
+  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
+
   return waitForHermesReady(baseUrl, {
     token,
     signal,
     fetchPublicJson,
-    fetchJson
+    fetchJson: probeIsCredentialed ? (url, _token, options) => probeHealth(url, options) : fetchJson,
+    probeHealth,
+    probeIsCredentialed
   })
 }
 
@@ -6822,7 +6919,10 @@ async function buildRemoteConnection(
     // here would reject a freshly-completed native sign-in and loop the UI back
     // into "not signed in" even though mintGatewayWsTicket would succeed with
     // the stored bearer.
-    if (!oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl))) {
+    if (
+      !oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl)) &&
+      oauthGuardMayHardFail(await gatewayAuthProviders(baseUrl))
+    ) {
       const err = new Error(
         'Remote Hermes gateway uses OAuth, but you are not signed in. ' +
           'Open Settings → Gateway and click "Sign in", or switch back to Local.'
@@ -7063,7 +7163,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
       pickLocalPort,
-      waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal),
+      waitForHermes: (baseUrl, token) => waitForHermes(baseUrl, token, lease.signal, 'token'),
       probeReuseProof: sshProbeReuseProof,
       adoptServedToken: adoptServedDashboardToken,
       rememberLog: sshRememberLog,
@@ -7536,6 +7636,7 @@ function stopBackendChild(child) {
 // switch / crash recovery), which still resets boot progress + reloads.
 function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
+  remoteReauthFailure = null
   remoteLiveness.clear()
   const hermesProcess = backendConnectionState.invalidate()
   stopBackendChild(hermesProcess)
@@ -7736,7 +7837,7 @@ async function spawnPoolBackend(profile, entry) {
   const remote = await resolveRemoteBackend(profile)
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token)
+    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
 
     return {
       ...remote,
@@ -7928,6 +8029,13 @@ async function startHermes() {
     throw backendStartFailure
   }
 
+  // A confirmed remote reauth rejection is terminal until the user signs in.
+  // Short-circuiting here keeps the boot-failure overlay latched and its
+  // "Sign in" button clickable, instead of re-driving boot on every retry.
+  if (remoteReauthFailure) {
+    throw remoteReauthFailure
+  }
+
   // E2E: simulate a boot failure without breaking the real backend. The boot
   // progresses a few steps, then fails with the given error message.
   if (BOOT_FAKE_ERROR) {
@@ -7954,7 +8062,7 @@ async function startHermes() {
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -8189,6 +8297,12 @@ async function startHermes() {
     // "Sign out & sign in" reload, and the wake-recovery revalidate path.
     if (shouldLatchBackendStartFailure({ attemptedRemote })) {
       backendStartFailure = error instanceof Error ? error : new Error(message)
+    }
+
+    // A confirmed reauth rejection latches separately: it can't self-heal, and
+    // leaving it unlatched hides the overlay's "Sign in" button on every retry.
+    if (shouldLatchRemoteReauthFailure({ attemptedRemote, isReauth: isReauthRequiredError(error) })) {
+      remoteReauthFailure = error instanceof Error ? error : new Error(message)
     }
 
     updateBootProgress(
@@ -8994,28 +9108,27 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   await teardownPrimaryBackendAndWait()
   bootstrapFailure = null
   backendStartFailure = null
+  remoteReauthFailure = null
   getFirstRunSetupGate().resetForRetry()
   resetBootstrapSnapshot()
 
   return { ok: true }
 })
 ipcMain.handle('hermes:bootstrap:repair', async () => {
-  // Forceful repair: drop the bootstrap-complete marker so the next
-  // startHermes() re-runs the full installer (refreshing a broken/partial
-  // venv), and clear any latched failure + live connection. The renderer
-  // reloads afterwards to re-drive the boot flow from scratch.
-  rememberLog('[bootstrap] repair requested by renderer; clearing marker + latched failure')
+  // Forceful repair: force the next startHermes() through the full installer
+  // (refreshing a broken/partial venv) and clear any latched failure + live
+  // connection. The renderer reloads afterwards to re-drive the boot flow.
+  //
+  // We do NOT delete the bootstrap marker here. Repair is also reachable from
+  // transient backend errors on a perfectly healthy install, and deleting the
+  // marker in that case stranded the app in first-run setup with no way back
+  // (#72166). The explicit flag carries the intent instead.
+  rememberLog('[bootstrap] repair requested by renderer; forcing reinstall + clearing latched failure')
 
-  try {
-    if (fileExists(BOOTSTRAP_COMPLETE_MARKER)) {
-      fs.rmSync(BOOTSTRAP_COMPLETE_MARKER, { force: true })
-    }
-  } catch (error) {
-    rememberLog(`[bootstrap] failed to remove marker during repair: ${error.message}`)
-  }
-
+  bootstrapRepairRequested = true
   bootstrapFailure = null
   backendStartFailure = null
+  remoteReauthFailure = null
   getFirstRunSetupGate().resetForRepair()
   resetHermesConnection()
 
@@ -9125,6 +9238,9 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
       })
 
       _storeNativeTokens(baseUrl, tokens)
+      // Confirmed sign-in — release the reauth latch so the next
+      // startHermes() re-dials instead of replaying the stale rejection.
+      remoteReauthFailure = null
 
       return { ok: true, baseUrl, connected: true }
     } catch (error) {
@@ -9141,7 +9257,16 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
   // Legacy embedded-webview cookie flow.
   await openOauthLoginWindow(baseUrl)
 
-  return { ok: true, baseUrl, connected: await hasOauthSessionCookie(baseUrl) }
+  const connected = await hasOauthSessionCookie(baseUrl)
+
+  // Only a CONFIRMED sign-in releases the latch. A cancelled/closed login
+  // window must leave it set, or the overlay's "Sign in" button starts
+  // flickering again on the next retry.
+  if (connected) {
+    remoteReauthFailure = null
+  }
+
+  return { ok: true, baseUrl, connected }
 })
 ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
   const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''

@@ -20,6 +20,7 @@ export type ToolTitleKey =
   | 'execute_code'
   | 'image_generate'
   | 'list_files'
+  | 'memory'
   | 'patch'
   | 'read_file'
   | 'search_files'
@@ -486,6 +487,8 @@ export interface Translations {
       modeTitle: string
       localTitle: string
       localDesc: string
+      inheritTitle: string
+      inheritDesc: string
       remoteTitle: string
       remoteDesc: string
       remoteAuthHint: string
@@ -1915,7 +1918,6 @@ export interface Translations {
       editModels: string
       refreshModels: string
       fast: string
-      medium: string
     }
     modelOptions: {
       noOptions: string

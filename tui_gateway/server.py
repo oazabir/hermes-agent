@@ -1849,6 +1849,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     session_db = SessionDB(db_path=Path(profile_home) / "state.db")
                 except Exception:
                     session_db = None
+
+            try:
+                from tui_gateway.entry import ensure_mcp_discovery_started
+
+                ensure_mcp_discovery_started()
+            except Exception:
+                logger.warning("MCP discovery startup failed", exc_info=True)
+
             try:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
@@ -2086,6 +2094,28 @@ def _session_cwd(session: dict | None) -> str:
     return _completion_cwd()
 
 
+# Sources whose launch directory is an artifact of how the app was started, not
+# a workspace the user picked. Everything else is terminal-started: the process
+# runs in a directory the user deliberately cd'd into.
+_LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
+
+
+def _persisted_session_cwd(session: dict) -> str | None:
+    """The cwd to stamp on the session's DB row, or None to leave it unset.
+
+    See :func:`_ensure_session_db_row` for why the launch directory counts as a
+    workspace for terminal sessions but not for the desktop.
+    """
+    if session.get("explicit_cwd"):
+        return _session_cwd(session)
+    if _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE:
+        return None
+    # Only the session's OWN directory. `_session_cwd` falls back to the
+    # gateway-wide completion cwd, which belongs to no session in particular —
+    # stamping that would invent a workspace for a session that never had one.
+    return str(session.get("cwd") or "") or None
+
+
 def _heal_dead_cwd(cwd: str) -> str:
     """Resolve a session cwd that points at a now-deleted directory.
 
@@ -2155,6 +2185,80 @@ def _display_session_cwd(session: dict | None) -> str:
     return healed
 
 
+def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
+    """Re-anchor a session that SETTLED in another git checkout. Returns moved.
+
+    An agent told to work in a fresh worktree does exactly that — `git worktree
+    add`, `cd` into it, and every later command runs there — but the session
+    stayed pinned to wherever it started, so the desktop kept labelling the chat
+    with the primary checkout's branch while all the work landed elsewhere.
+
+    A plain `cd` is deliberately NOT a workspace move (see
+    ``_apply_project_workspace``): browsing to /tmp to read a log must not
+    re-home the chat. What we adopt here is narrower — the session's recorded
+    cwd is in a DIFFERENT git working tree than its workspace. That is a
+    relocation by any reading, and it is the only shape this reconciles.
+
+    Local backends only: a remote/SSH cwd names a path on the host, which this
+    gateway can neither stat nor probe with git.
+    """
+    if not session or not _is_local_terminal_backend():
+        return False
+
+    try:
+        from tools.terminal_tool import get_session_cwd
+
+        recorded = get_session_cwd(session.get("session_key") or "")
+    except Exception:
+        return False
+
+    if not recorded:
+        return False
+
+    resolved = os.path.abspath(os.path.expanduser(str(recorded)))
+    current = os.path.abspath(os.path.expanduser(_session_cwd(session)))
+    if resolved == current or not os.path.isdir(resolved):
+        return False
+
+    # The worktree ROOT, not the common repo root: folding worktrees together
+    # here is exactly what hides the move we're looking for.
+    landed = _git_repo_root_for_cwd(resolved)
+    if not landed or landed == _git_repo_root_for_cwd(current):
+        return False
+
+    session["cwd"] = resolved
+    # The session works here now, so this is its workspace — a desktop chat
+    # whose cwd was an unpersisted launch artifact earns a real row.
+    session["explicit_cwd"] = True
+    _register_session_cwd(session)
+
+    with _session_db(session) as db:
+        if db is not None:
+            try:
+                db.update_session_cwd(session.get("session_key", ""), resolved)
+            except Exception:
+                logger.debug("failed to persist settled session cwd", exc_info=True)
+
+    _persist_session_git_meta(session, resolved)
+    return True
+
+
+def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
+    """Emit end-of-turn ``session.info``, reconciling a settled cwd first.
+
+    The turn is over, so the agent has stopped moving: this is the one moment
+    where its recorded cwd is a stable answer to "where does this session
+    work". Reconciling before building the payload means the same event that
+    already tells the desktop the turn ended also carries the new cwd/branch —
+    the client follows it with no new event type and no extra round trip.
+    """
+    try:
+        _reconcile_session_cwd_from_terminal(session)
+    except Exception:
+        logger.debug("failed to reconcile settled session cwd", exc_info=True)
+    _emit("session.info", sid, _session_info(agent, session))
+
+
 def _session_source(session: dict | None) -> str:
     if session:
         source = str(session.get("source") or "").strip()
@@ -2184,12 +2288,19 @@ def _ensure_session_db_row(session: dict) -> None:
     Uses INSERT OR IGNORE under the hood, so re-calls (and the AIAgent's own
     lazy create) are no-ops.
 
-    Only an *explicitly chosen* workspace is persisted as the session's cwd.
-    The agent still runs in the auto-detected directory (session["cwd"]), but
-    we don't stamp that onto the row — otherwise every session the user never
-    picked a folder for gets grouped under whatever directory the desktop
-    happened to launch in (e.g. "desktop"). Leaving it null groups them under
-    "No workspace", which is the desired default.
+    A cwd the user *chose* is always persisted. When they made no explicit
+    choice the launch directory stands in, and whether that is meaningful
+    depends on how the session was started:
+
+    * The desktop launches from wherever the app bundle was opened (often ``/``
+      or the user's home), so stamping that would file every unpicked chat under
+      a folder the user never chose. Those stay null and group under "No
+      workspace", which is the desired default.
+    * A terminal session (``hermes`` / ``hermes --tui`` / CLI) is started from a
+      directory the user deliberately ``cd``'d into — that IS the workspace, and
+      it is also where the agent's terminal actually runs. Dropping it stranded
+      the session with no cwd AND no git_repo_root, so the sidebar could never
+      place it under its project.
     """
     key = session.get("session_key")
     if not key:
@@ -2278,7 +2389,7 @@ def _ensure_session_db_row(session: dict) -> None:
             model=row_model,
             model_config=model_config or None,
             parent_session_id=parent_session_id,
-            cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
@@ -4394,10 +4505,20 @@ def _session_info(agent, session: dict | None = None) -> dict:
 
 
 def _tool_ctx(name: str, args: dict) -> str:
-    try:
-        from agent.display import build_tool_label
+    """Argument preview for a tool row — never a phrased label.
 
-        return build_tool_label(name, args, max_len=80) or ""
+    Clients own their own phrasing: the TUI wraps this as ``Terminal("...")``
+    and the desktop prepends its own localized verb ("Running"/"Ran"). Sending
+    ``build_tool_label`` here instead of the raw preview stutters the verb on
+    both surfaces ("Running Running sleep 70 + 2 commands") and leaks a display
+    label into the desktop's ``args.context``, where it stands in for the real
+    command. The friendly labels belong on the CLI spinner, which builds them
+    from ``build_tool_label`` at its own call sites.
+    """
+    try:
+        from agent.display import build_tool_preview
+
+        return build_tool_preview(name, args, max_len=80) or ""
     except Exception:
         return ""
 
@@ -5648,7 +5769,7 @@ def _make_agent(
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
-        max_iterations=_cfg_max_turns(cfg, 90),
+        max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
@@ -6946,6 +7067,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("verification.status")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Best known coding verification evidence for a cwd/session.
 
@@ -9234,6 +9356,32 @@ def _serialize_billing_state(state) -> dict:
             "display": state.card.display,
             "resolved_via": state.card.resolved_via,
         }
+    payment_method = None
+    if state.payment_method is not None:
+        pm = state.payment_method
+        # Each kind sends only its own fields. Emitting every key with nulls
+        # would contradict the shared type — a client checking `'brand' in pm`
+        # would read every Link method as a card.
+        if pm.kind == "card":
+            payment_method = {
+                "kind": "card",
+                "brand": pm.brand,
+                "last4": pm.last4,
+                "wallet": pm.wallet,
+                "resolved_via": pm.resolved_via,
+            }
+        elif pm.kind == "link":
+            payment_method = {
+                "kind": "link",
+                "email": pm.email,
+                "resolved_via": pm.resolved_via,
+            }
+        else:
+            payment_method = {
+                "kind": "unknown",
+                "raw_kind": pm.raw_kind,
+                "resolved_via": pm.resolved_via,
+            }
     monthly_cap = None
     if state.monthly_cap is not None:
         mc = state.monthly_cap
@@ -9283,6 +9431,7 @@ def _serialize_billing_state(state) -> dict:
         "min_usd": _s(state.min_usd),
         "max_usd": _s(state.max_usd),
         "card": card,
+        "payment_method": payment_method,
         "monthly_cap": monthly_cap,
         "auto_reload": auto_reload,
         "portal_url": state.portal_url,
@@ -10930,6 +11079,158 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
+# Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
+# the cursor advances past them and they can't wedge a later completed/blocked
+# event behind an unclaimed row.
+_KANBAN_NOTIFY_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "status", "archived", "unblocked",
+)
+_KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
+_KANBAN_POLL_SECONDS = 5.0
+
+
+def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
+    """Single-line notification text for one kanban event.
+
+    Wording mirrors the gateway notifier (gateway/kanban_watchers.py) so a
+    task completion reads the same in the TUI as it does on Telegram.
+    Returns None for kinds that are claimed but intentionally silent.
+    """
+    kind = getattr(ev, "kind", "")
+    if not kind or kind in _KANBAN_SILENT_KINDS:
+        return None
+    task_id = sub.get("task_id", "")
+    title = (getattr(task, "title", None) or task_id)[:120]
+    board_tag = f"[{board_slug}] " if board_slug else ""
+    who = getattr(task, "assignee", None) or ""
+    tag = f"@{who} " if who else ""
+    payload = getattr(ev, "payload", None) or {}
+    if kind == "completed":
+        handoff = ""
+        summary = payload.get("summary")
+        if summary:
+            lines = str(summary).strip().splitlines()
+            handoff = f"\n{lines[0][:200]}" if lines else ""
+        elif getattr(task, "result", None):
+            lines = str(task.result).strip().splitlines()
+            handoff = f"\n{lines[0][:160]}" if lines else ""
+        return f"✔ {board_tag}{tag}Kanban {task_id} done — {title}{handoff}"
+    if kind == "blocked":
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+    if kind == "gave_up":
+        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
+        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+    if kind == "crashed":
+        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+    if kind == "timed_out":
+        limit = 0
+        try:
+            limit = int(payload.get("limit_seconds") or 0)
+        except (TypeError, ValueError):
+            pass
+        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+    if kind == "status":
+        return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+    return None
+
+
+def _collect_kanban_notifications(session: dict) -> list:
+    """Claim unseen terminal kanban events for this TUI session's subscriptions.
+
+    ``kanban_create`` auto-subscribes TUI/desktop sessions with
+    ``platform="tui"`` and ``chat_id=HERMES_SESSION_KEY`` (see
+    tools/kanban_tools.py ``_maybe_auto_subscribe``). The gateway notifier
+    can't deliver those — there is no "tui" messaging adapter — so this
+    poller is the delivery path for them (issue #59890). Uses the same
+    atomic cursor-claim (``claim_unseen_events_for_sub``) as the gateway
+    notifier, so a subscription is delivered exactly once even if a gateway
+    and a TUI poll the same board DB.
+
+    Returns the list of formatted notification texts (may be empty).
+    """
+    session_key = str(session.get("session_key") or "")
+    if not session_key or session.get("_finalized"):
+        return []
+    try:
+        from hermes_cli import kanban_db as _kb
+    except Exception:
+        return []
+    texts: list = []
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        try:
+            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+        except Exception:
+            return []
+    # Poll each resolved DB path once — multiple slugs can point at the same
+    # DB when HERMES_KANBAN_DB pins the board path (same guard as the gateway
+    # notifier).
+    seen_db_paths: set = set()
+    for board_meta in boards:
+        slug = (board_meta or {}).get("slug") or _kb.DEFAULT_BOARD
+        db_path = (board_meta or {}).get("db_path")
+        try:
+            resolved = (
+                str(Path(db_path).expanduser().resolve())
+                if db_path else str(_kb.kanban_db_path(slug).resolve())
+            )
+        except Exception:
+            resolved = f"slug:{slug}"
+        if resolved in seen_db_paths:
+            continue
+        seen_db_paths.add(resolved)
+        try:
+            conn = _kb.connect(board=slug)
+        except Exception:
+            continue
+        try:
+            try:
+                subs = _kb.list_notify_subs(conn)
+            except Exception:
+                continue
+            for sub in subs:
+                if (sub.get("platform") or "").lower() != "tui":
+                    continue
+                if sub.get("chat_id") != session_key:
+                    continue
+                _old, _new, events = _kb.claim_unseen_events_for_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    kinds=_KANBAN_NOTIFY_KINDS,
+                )
+                if not events:
+                    continue
+                task = _kb.get_task(conn, sub["task_id"])
+                for ev in events:
+                    text = _format_kanban_event_text(sub, task, ev, slug)
+                    if text:
+                        texts.append(text)
+                # Unsubscribe only at a truly final status (done/archived);
+                # blocked/crashed subs stay live so a respawned task's next
+                # terminal event still reaches the user (same rule as the
+                # gateway notifier).
+                if task and getattr(task, "status", "") in {"done", "archived"}:
+                    try:
+                        _kb.remove_notify_sub(
+                            conn,
+                            task_id=sub["task_id"],
+                            platform=sub["platform"],
+                            chat_id=sub["chat_id"],
+                            thread_id=sub.get("thread_id") or "",
+                        )
+                    except Exception:
+                        pass
+        finally:
+            conn.close()
+    return texts
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -10942,11 +11243,56 @@ def _notification_poller_loop(
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
+
+    Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this
+    session's TUI kanban subscriptions and delivers terminal task events the
+    same way (status.update + agent turn) — the delivery path
+    tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    _last_kanban_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
+        _now = time.monotonic()
+        if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
+            _last_kanban_poll = _now
+            try:
+                _kanban_texts = _collect_kanban_notifications(session)
+            except Exception as _kb_exc:
+                print(
+                    f"[tui_gateway] kanban notification poll failed: "
+                    f"{type(_kb_exc).__name__}: {_kb_exc}",
+                    file=sys.stderr,
+                )
+                _kanban_texts = []
+            if _kanban_texts:
+                for _kb_text in _kanban_texts:
+                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
+                # Events are cursor-claimed (never re-queued), so buffer them
+                # until the session is idle instead of dropping the agent turn.
+                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
+            _pending = session.get("_kanban_pending") or []
+            if _pending:
+                _batch: list = []
+                with session["history_lock"]:
+                    if not session.get("running"):
+                        session["running"] = True
+                        _batch = list(_pending)
+                        session["_kanban_pending"] = []
+                if _batch:
+                    rid = f"__notif__{int(time.time() * 1000)}"
+                    try:
+                        _emit("message.start", sid)
+                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                    except Exception as exc:
+                        print(
+                            f"[tui_gateway] kanban notification dispatch failed: "
+                            f"{type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                        with session["history_lock"]:
+                            session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
@@ -11831,7 +12177,7 @@ def _run_prompt_submit(
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
-            _emit("session.info", sid, _session_info(agent, session))
+            _emit_settled_session_info(sid, session, agent)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -13691,7 +14037,12 @@ def _discover_repos_payload(
                 agg = _agg(root)
                 if entry.get("label"):
                     agg["label"] = entry["label"]
-                agg["last_active"] = max(agg["last_active"], float(entry.get("last_seen") or 0))
+                # NOTE: `last_seen` is when the disk scan last saw the directory,
+                # not when the user last worked in it. Folding it into
+                # `last_active` stamped every scanned repo with the scan time —
+                # i.e. "just now" — so a git checkout with zero Hermes sessions
+                # outranked the repos the user actually works in. Activity stays
+                # session-derived; a repo with no sessions has no activity.
 
         if conn is not None:
             _read(conn)
@@ -13888,12 +14239,34 @@ def _project_tree_inputs(
     return sessions, projects, discovered, active_id
 
 
+# Per-build memo for `_dir_exists_cached`. Cleared at the top of every
+# `_build_project_tree`, so a dir created or deleted between sidebar refreshes
+# is seen on the next one.
+_DIR_EXISTS_CACHE: dict[str, bool] = {}
+
+
+def _dir_exists_cached(path: str) -> bool:
+    """``os.path.isdir`` for the project tree, memoized per build.
+
+    ``build_tree`` asks per SESSION, not per distinct path, so a power user with
+    hundreds of sessions across a handful of dirs would otherwise fire hundreds
+    of redundant stats on every sidebar open. The memo is per build, so a dir
+    created or deleted between refreshes is picked up on the next one.
+    """
+    hit = _DIR_EXISTS_CACHE.get(path)
+    if hit is None:
+        hit = os.path.isdir(path)
+        _DIR_EXISTS_CACHE[path] = hit
+    return hit
+
+
 def _build_project_tree(
     db, *, preview_limit: int, hydrate: bool, session_limit: int, include_discovered: bool
 ) -> tuple[dict, str | None]:
     """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
     from tui_gateway import project_tree
 
+    _DIR_EXISTS_CACHE.clear()
     sessions, projects, discovered, active_id = _project_tree_inputs(
         db, session_limit, include_discovered=include_discovered
     )
@@ -13906,6 +14279,7 @@ def _build_project_tree(
         hydrate=hydrate,
         is_junk_root=_is_repo_junk,
         is_junk_cwd=_is_session_cwd_junk,
+        exists=_dir_exists_cached,
     )
     return tree, active_id
 
@@ -15806,6 +16180,14 @@ def _(rid, params: dict) -> dict:
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
         doc = Document(text, len(text))
+        # Skill commands and bundles are the only completions offered for an
+        # inline `/skill` reference typed mid-message, so the class has to
+        # reach the TUI as data. Derived from the same providers the completer
+        # uses — no sniffing the ⚡/▣ meta glyphs, which are display text.
+        skill_names = {
+            key.lstrip("/").lower()
+            for key in (*get_skill_commands(), *get_skill_bundles())
+        }
         items = [
             {
                 "text": c.text,
@@ -15816,6 +16198,11 @@ def _(rid, params: dict) -> dict:
                 # layout into 1-char truncation of the next column.
                 "display": to_plain_text(c.display) if c.display else c.text,
                 "meta": to_plain_text(c.display_meta) if c.display_meta else "",
+                "kind": (
+                    "skill"
+                    if c.text.strip().lstrip("/").lower() in skill_names
+                    else "command"
+                ),
             }
             for c in completer.get_completions(doc, None)
         ][:30]
@@ -15825,21 +16212,25 @@ def _(rid, params: dict) -> dict:
                 "text": "/density",
                 "display": "/density",
                 "meta": "Toggle compact display mode",
+                "kind": "command",
             },
             {
                 "text": "/details",
                 "display": "/details",
                 "meta": "Control agent detail visibility",
+                "kind": "command",
             },
             {
                 "text": "/logs",
                 "display": "/logs",
                 "meta": "Show recent gateway log lines",
+                "kind": "command",
             },
             {
                 "text": "/mouse",
                 "display": "/mouse",
                 "meta": "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]",
+                "kind": "command",
             },
         ]
         for extra in extras:
@@ -17412,7 +17803,7 @@ def _(rid, params: dict) -> dict:
             {
                 "title": "Agent",
                 "rows": [
-                    ["Max Turns", str(_cfg_max_turns(cfg, 90))],
+                    ["Max Turns", str(_cfg_max_turns(cfg, 500))],
                     ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
                     ["Verbose", str(cfg.get("verbose", False))],
                 ],
@@ -17472,7 +17863,10 @@ def _(rid, params: dict) -> dict:
             if session
             else _load_enabled_toolsets()
         )
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+        # Pre-assembly list: /tools is a discovery surface and must show
+        # tools deferred behind the tool_search bridge (same as the CLI).
+        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True,
+                                     skip_tool_search_assembly=True)
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):
