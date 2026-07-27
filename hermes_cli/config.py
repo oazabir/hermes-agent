@@ -1108,6 +1108,18 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # Max seconds the gateway waits for boot auto-resume turns to finish
+        # before it releases the startup-restore inbound gate.  While startup
+        # restore is in progress the gateway QUEUES every inbound message
+        # instead of replying, so no channel gets an answer until this gate
+        # opens.  Without a bound, one pathologically long resumed turn holds
+        # the gate shut and every channel's inbound piles up unanswered for as
+        # long as that turn runs.  On timeout the gate releases and the slow
+        # resume turn keeps running in the background; duplicate-agent
+        # protection is unaffected because the resume slot is claimed
+        # synchronously before the gate runs.  Set to 0 to disable the bound
+        # (historical "wait forever" behaviour).
+        "gateway_startup_restore_drain_timeout": 30,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
         # seconds. When the base stale timeout is at its default (180s) and a
         # local endpoint is detected, this finite ceiling replaces the former
@@ -1408,6 +1420,18 @@ DEFAULT_CONFIG = {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+        },
+        # Per-turn runaway-loop caps (inspired by Claude Code v2.1.212,
+        # Week 29, July 2026). Hard ceilings on how many times a runaway-prone
+        # tool may be called within a SINGLE agent loop (turn); the counters
+        # reset at the start of every turn, so a legitimate multi-turn session
+        # is never starved. They are always-on and fire regardless of the
+        # warn/hard-stop thresholds above. A single turn issuing dozens of web
+        # searches or spawning dozens of subagents is already pathological, so
+        # the defaults are low. Set either to 0 to disable that cap (unlimited).
+        "loop_caps": {
+            "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
+            "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
         },
     },
 
@@ -1954,6 +1978,14 @@ DEFAULT_CONFIG = {
         # Show a color-coded battery read-out as the first status-bar element in
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
+        # Focus view (/focus): display-only reduced-output mode. When true the
+        # CLI/TUI pins tool_progress to "off" (reusing the existing suppression
+        # path), reports a per-turn hidden-line count with a recovery hint, and
+        # pins a "focus" segment in the status bar. focus_saved_tool_progress
+        # holds the mode /focus off restores. Never affects what is sent to the
+        # model — see hermes_cli/focus_view.py.
+        "focus_view": False,
+        "focus_saved_tool_progress": "all",
         "skin": "default",
         # UI language for static user-facing messages (approval prompts, a
         # handful of gateway slash-command replies).  Does NOT affect agent
@@ -1990,6 +2022,16 @@ DEFAULT_CONFIG = {
         # tool name. Applies to CLI spinner + gateway/desktop tool-progress.
         # Custom/plugin/MCP tools always fall back to the raw preview.
         "friendly_tool_labels": True,
+        # CLI-only post-turn accounting line printed after each interactive turn:
+        # "⋯ 12.4s · edited 2 files +18 -3 · read 4 files · ran 3 commands".
+        # Observed from the tool-progress feed the CLI already receives; never
+        # printed in quiet/non-interactive paths or in gateway/messaging
+        # surfaces (those have their own runtime footer).
+        "turn_summary": True,
+        # CLI-only: append cumulative turn output tokens to the live spinner
+        # timer ("⚡ Reading file  ( 2.3s · ↓ 1.2k tok)"). Updates as each API
+        # call in the turn reports usage.
+        "spinner_token_flow": True,
         # How gateway tool-progress is grouped on platforms that support message
         # editing: "accumulate" (default) edits one bubble in place; "separate"
         # sends one message per tool (the pre-v0.9 behavior, noisier). Only
@@ -2730,6 +2772,20 @@ DEFAULT_CONFIG = {
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
+        # Operator-customizable policy text for smart approvals. When
+        # non-empty, this is appended to the smart-approval guardian's
+        # SYSTEM prompt (trusted channel) as additional rules — e.g.
+        # "Always ESCALATE commands touching /etc" or "APPROVE docker
+        # compose restarts under ~/deploys". Inspired by ChatGPT Work's
+        # customizable auto-review guardian policy.
+        "smart_policy": "",
+        # Consecutive-denial circuit breaker for smart approvals: after this
+        # many guardian DENY verdicts in a row within one session, the deny
+        # message returned to the model escalates to a hard-stop instruction
+        # (report to the user / ask for manual run or /approve) instead of a
+        # plain "Do NOT retry". Any approval resets the count. 0 disables.
+        # Inspired by ChatGPT Work's auto-review circuit breaker.
+        "denial_breaker_threshold": 3,
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the
         # --yolo / /yolo / mode=off bypass — making this the user-editable
@@ -3264,14 +3320,15 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
-        # When true, prune ended sessions older than retention_days once
+        # When true, prune ended sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
-        # Only touches ended sessions — active sessions are always preserved.
+        # Activity is the latest message timestamp, falling back to creation
+        # time for empty sessions. Active sessions are always preserved.
         # Default false: session history is valuable for search recall, and
         # silently deleting it could surprise users.  Opt in explicitly.
         "auto_prune": False,
-        # How many days of ended-session history to keep.  Matches the
-        # default of ``hermes sessions prune``.
+        # How many inactive days of ended-session history to keep. Matches
+        # the default of ``hermes sessions prune``.
         "retention_days": 90,
         # When true, auto-archive (soft-hide, never delete) sessions that
         # haven't been touched in ``auto_archive_days`` days, once per

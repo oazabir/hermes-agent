@@ -2693,6 +2693,30 @@ class BasePlatformAdapter(ABC):
         """
         return len
 
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        """Per-chat max message length, in ``message_len_fn_for_chat`` units.
+
+        Default: the adapter-scalar ``MAX_MESSAGE_LENGTH`` (4096 when absent) —
+        for a native adapter every chat lives on the same platform so the
+        scalar is already correct. The relay adapter overrides this: one relay
+        adapter fronts N platforms with different caps (Discord 2000 vs
+        Telegram 4096 vs Slack 39000), and the right cap depends on which
+        platform the chat's inbound arrived from.
+        """
+        try:
+            return int(getattr(self, "MAX_MESSAGE_LENGTH", 4096) or 4096)
+        except (TypeError, ValueError):
+            return 4096
+
+    def message_len_fn_for_chat(self, chat_id: str) -> Callable[[str], int]:
+        """Per-chat length function (companion to max_message_length_for_chat).
+
+        Default: the adapter-wide ``message_len_fn``. The relay adapter
+        overrides it so a Telegram-fronted chat measures UTF-16 units while a
+        Discord-fronted chat on the same adapter measures codepoints.
+        """
+        return self.message_len_fn
+
     @property
     def enforces_own_access_policy(self) -> bool:
         """Whether this adapter gates inbound access before dispatch.
@@ -3512,11 +3536,28 @@ class BasePlatformAdapter(ABC):
         override this for a richer UX.
         """
         if choices:
+            # Multi-select clarifies register their flag on the pending entry;
+            # look it up by id so the signature stays adapter-compatible.
+            _is_multi = False
+            try:
+                from tools import clarify_gateway as _cg
+                with _cg._lock:
+                    _entry = _cg._entries.get(clarify_id)
+                _is_multi = bool(_entry and getattr(_entry, "multi_select", False))
+            except Exception:
+                _is_multi = False
             lines = [f"❓ {question}", ""]
             for i, choice in enumerate(choices, start=1):
                 lines.append(f"  {i}. {choice}")
             lines.append("")
-            lines.append("Reply with the number, the option text, or your own answer.")
+            if _is_multi:
+                lines.append(
+                    "Multiple selections allowed — reply with the numbers "
+                    "separated by commas or spaces (e.g. \"1, 3\"), the option "
+                    "text, or your own answer."
+                )
+            else:
+                lines.append("Reply with the number, the option text, or your own answer.")
             text = "\n".join(lines)
             # Text fallback: enable text-capture so the gateway intercept
             # picks up the user's typed reply (e.g. "2" or choice text).

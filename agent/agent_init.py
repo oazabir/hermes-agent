@@ -645,6 +645,13 @@ def init_agent(
         # AWS Bedrock — auto-detect from provider name or base URL
         # (bedrock-runtime.<region>.amazonaws.com).
         agent.api_mode = "bedrock_converse"
+    elif agent.provider in {"nous", "nous-portal", "nousresearch"}:
+        # Portal is dual-wire: anthropic/* → Messages, everything else →
+        # chat_completions. Callers that already pass api_mode win above;
+        # this covers direct AIAgent construction without a resolved runtime.
+        from hermes_cli.providers import nous_api_mode
+
+        agent.api_mode = nous_api_mode(agent.model)
     else:
         agent.api_mode = "chat_completions"
 
@@ -1952,8 +1959,12 @@ def init_agent(
     # parent_session_id chain, no `name #N` renumber). See #38763 and
     # agent/conversation_compression.py. Consumed by compress_context(), not the
     # compressor, so it rides on the agent.
+    # Default True must match DEFAULT_CONFIG["compression"]["in_place"]
+    # (#38763). default=False here previously flipped agents into rotation
+    # mode whenever the merged config omitted the key (partial configs,
+    # load_config failure → {}), re-arming the pre-lease drift abort.
     compression_in_place = is_truthy_value(
-        _compression_cfg.get("in_place"), default=False
+        _compression_cfg.get("in_place"), default=True
     )
     codex_app_server_auto_compaction = str(
         _compression_cfg.get("codex_app_server_auto", "native") or "native"

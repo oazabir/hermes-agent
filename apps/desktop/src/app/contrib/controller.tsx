@@ -39,6 +39,7 @@ import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { LayoutDashboard } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import { $artifactTabs } from '@/store/artifacts'
 import {
   $fileBrowserOpen,
   $panesFlipped,
@@ -51,7 +52,7 @@ import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH
 } from '@/store/layout'
-import { $filePreviewTarget, $previewTarget, closeRightRail } from '@/store/preview'
+import { $filePreviewTabs, $filePreviewTarget, $previewTarget, closeRightRail } from '@/store/preview'
 import { $reviewOpen, closeReview, REVIEW_PANE_ID } from '@/store/review'
 import { $currentCwd, $selectedStoredSessionId, $sessions, sessionMatchesStoredId } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
@@ -552,9 +553,10 @@ bindPaneCollapse(
 // Preview EXISTS only while something is previewed (old-shell semantics:
 // closing the last preview tab closes the pane; a new target opens + fronts
 // it). Same visibility binding as every other self-managed surface, driven
-// by the live targets instead of a toggle.
-const $previewVisible = computed([$previewTarget, $filePreviewTarget], (target, fileTarget) =>
-  Boolean(target || fileTarget)
+// by the live targets (and open artifact tabs) instead of a toggle.
+const $previewVisible = computed(
+  [$previewTarget, $filePreviewTabs, $artifactTabs],
+  (target, fileTabs, artifactTabs) => Boolean(target) || fileTabs.length > 0 || artifactTabs.length > 0
 )
 
 bindPaneVisibility('preview', $previewVisible, closeRightRail)
@@ -603,6 +605,17 @@ const revealPreview = () => {
 
 $previewTarget.listen(target => target && revealPreview())
 $filePreviewTarget.listen(target => target && revealPreview())
+// Artifact reveal keys on tab OPENS (length grows), not list identity — closing
+// one of two artifact tabs must not re-front the pane.
+let lastArtifactTabCount = $artifactTabs.get().length
+$artifactTabs.listen(tabs => {
+  const grew = tabs.length > lastArtifactTabCount
+  lastArtifactTabCount = tabs.length
+
+  if (grew) {
+    revealPreview()
+  }
+})
 
 // ---------------------------------------------------------------------------
 
@@ -652,7 +665,7 @@ export function ContribController() {
                   tree-published --workspace-left/right vars (pure CSS, no rect
                   threading), clamped to clear the REAL TitlebarControls
                   clusters (fixed, z-70); center is truly window-centered. */}
-          <div className="relative flex h-[34px] shrink-0 items-center border-b border-(--ui-stroke-tertiary) text-xs">
+          <div className="relative flex h-[34px] shrink-0 items-center bg-(--ui-sidebar-surface-background) text-xs">
             {/* Drag strips, AppShell-style: cut to AVOID the fixed control
                 clusters instead of overlapping them — Electron's no-drag
                 carve-out of fixed/transformed elements is unreliable, so a

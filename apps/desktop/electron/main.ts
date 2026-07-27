@@ -14,6 +14,7 @@ import {
   clipboard,
   dialog,
   net as electronNet,
+  globalShortcut,
   ipcMain,
   Menu,
   nativeImage,
@@ -63,10 +64,12 @@ import {
   profileRemoteOverride,
   profileSshOverride,
   resolveAuthMode,
+  resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
   tokenPreview
 } from './connection-config'
+import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import {
@@ -81,6 +84,7 @@ import {
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
+import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
 import { readDirForIpc } from './fs-read-dir'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
@@ -140,8 +144,16 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import { fetchPrimaryProfileSessions } from './profile-session-routing'
+import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
-import { RemoteLivenessTracker, RemoteRevalidationCoordinator, revalidateRemoteConnection } from './remote-liveness'
+import {
+  RemoteLivenessTracker,
+  RemoteRevalidationCoordinator,
+  revalidatePooledRemoteBackends,
+  revalidateRemoteConnection
+} from './remote-liveness'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -374,9 +386,9 @@ if (IS_WINDOWS) {
 ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 
 // Keep the renderer running at full speed while the window is in the background
-// or occluded. The chat transcript streams to screen through a
-// requestAnimationFrame-gated flush; Chromium pauses rAF (and clamps timers)
-// for backgrounded/occluded renderers, so without these the live answer stalls
+// or occluded. The chat transcript streams to screen through a bounded timer
+// flush; Chromium clamps timers for backgrounded/occluded renderers, so without
+// these the live answer stalls
 // whenever the window loses focus (switching to your editor mid-turn, detached
 // devtools, another window covering it) and only paints on refocus or refresh.
 // `backgroundThrottling: false` on the BrowserWindow covers the blurred case;
@@ -596,6 +608,10 @@ const DESKTOP_LOG_DISCARD_BYTES = DESKTOP_LOG_MAX_BYTES * 4
 const desktopLogBackupPath = n => `${DESKTOP_LOG_PATH}.${n}`
 const BOOT_FAKE_MODE = process.env.HERMES_DESKTOP_BOOT_FAKE === '1'
 const BOOT_FAKE_ERROR = process.env.HERMES_DESKTOP_BOOT_FAKE_ERROR || ''
+// Automated teardown (Playwright's app.close(), harness scripts) quits with
+// nobody to answer a modal, so the active-work confirmation would hang the
+// caller instead of letting the process exit. Force quits set this.
+const SKIP_QUIT_CONFIRM = process.env.HERMES_DESKTOP_SKIP_QUIT_CONFIRM === '1'
 
 const BOOT_FAKE_STEP_MS = (() => {
   const raw = Number.parseInt(String(process.env.HERMES_DESKTOP_BOOT_FAKE_STEP_MS || ''), 10)
@@ -1207,6 +1223,14 @@ function rememberLog(chunk) {
   }
 
   scheduleDesktopLogFlush()
+}
+
+installCrashForensics({ flush: flushDesktopLogBufferSync, log: rememberLog })
+
+// A rejected loadURL leaves a blank window and, unhandled, no trace anywhere
+// the user can send us. `label` names the surface so the log says which one.
+function loadWindowUrl(win, url, label) {
+  win.loadURL(url).catch(error => rememberLog(`${label} failed to load: ${describeCrashReason(error)}`))
 }
 
 function openExternalUrl(rawUrl) {
@@ -2490,6 +2514,12 @@ let updateInFlight = false
 // set, window-all-closed calls app.quit() on every platform so the process
 // actually dies and the hand-off script can proceed immediately.
 let isQuittingForHandoff = false
+
+// Quit-guard latches: one while the confirmation is on screen (a second
+// Cmd-Q must not stack dialogs), one after the user has said "quit anyway"
+// (the app.quit() that follows re-enters before-quit and must pass through).
+let quitPromptOpen = false
+let quitConfirmedWithActiveWork = false
 
 // Resolve the staged updater binary. The Tauri installer copies itself to
 // HERMES_HOME/hermes-setup.exe on a successful install (see
@@ -4936,6 +4966,8 @@ function getNativeOverlayWidth() {
 function getWindowState(win = mainWindow) {
   return {
     isFullscreen: Boolean(win?.isFullScreen?.()),
+    isMinimized: Boolean(win?.isMinimized?.()),
+    isVisible: Boolean(win?.isVisible?.()),
     nativeOverlayWidth: getNativeOverlayWidth(),
     windowButtonPosition: getWindowButtonPosition()
   }
@@ -7721,15 +7753,28 @@ function primaryProfileKey() {
   return readActiveDesktopProfile() || 'default'
 }
 
-// Resolve a backend connection for the given profile. Routes the primary
-// profile to startHermes() (the window backend: boot UI, bootstrap, remote
-// mode), and any OTHER profile to a lazily-spawned pool backend. An empty /
-// unknown profile resolves to the primary, so all legacy callers are unchanged.
+// Options describing the current connection setup for `resolveProfileBackendRoute`.
+function profileRouteOptions(profile) {
+  return {
+    globalRemote: globalRemoteActive(),
+    primaryProfile: primaryProfileKey(),
+    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile))
+  }
+}
+
+// Resolve a backend connection for the given profile, per the routing table in
+// resolveProfileBackendRoute(). An empty / unknown profile resolves to the
+// primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
-  if (key === primaryProfileKey()) {
-    return startHermes()
+  if (route.backend === 'primary') {
+    const connection = await startHermes()
+
+    // A shared backend still owes the caller its profile scope, so renderer-side
+    // WebSocket, filesystem, and cache routing target the selected profile.
+    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
   }
 
   const existing = backendPool.get(key)
@@ -7742,7 +7787,15 @@ async function ensureBackend(profile) {
 
   evictLruPoolBackends(POOL_MAX_BACKENDS - 1)
 
-  const entry = { process: null, port: null, token: null, connectionPromise: null, lastActiveAt: Date.now() }
+  const entry = {
+    process: null,
+    port: null,
+    token: null,
+    connectionPromise: null,
+    lastActiveAt: Date.now(),
+    remoteBaseUrl: null
+  }
+
   entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
     backendPool.delete(key)
     throw error
@@ -7838,6 +7891,10 @@ async function spawnPoolBackend(profile, entry) {
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+
+    // Recorded on the entry so revalidation can probe this descriptor without
+    // awaiting connectionPromise, which may still be pending for a sibling.
+    entry.remoteBaseUrl = remote.baseUrl
 
     return {
       ...remote,
@@ -8429,12 +8486,14 @@ function spawnSecondaryWindow({ sessionId, watch }: { sessionId?: string; watch?
 
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
 
-  win.loadURL(
+  loadWindowUrl(
+    win,
     buildSessionWindowUrl(sessionId, {
       devServer: DEV_SERVER,
       rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
       watch
-    })
+    }),
+    'Session window'
   )
 
   return win
@@ -8514,11 +8573,7 @@ function createInstanceWindow() {
     instanceWindows.delete(win)
   })
 
-  if (DEV_SERVER) {
-    win.loadURL(DEV_SERVER)
-  } else {
-    win.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
+  loadWindowUrl(win, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Instance window')
 
   return win
 }
@@ -8630,7 +8685,7 @@ function spawnPetOverlayWindow(bounds) {
     }
   })
 
-  win.loadURL(petOverlayUrl())
+  loadWindowUrl(win, petOverlayUrl(), 'Pet overlay')
 
   return win
 }
@@ -8664,6 +8719,211 @@ function closePetOverlay() {
   petOverlayWindow = null
 }
 
+// ── Quick Entry ─────────────────────────────────────────────────────────────
+//
+// A global shortcut summons a small frameless always-on-top composer from
+// anywhere, so a prompt can be fired without raising the whole app. The window
+// carries NO gateway connection: it hands its text to us, we forward it to the
+// PRIMARY renderer, and that renderer submits through the same prompt path the
+// normal composer uses (see store/quick-entry + hooks/use-quick-entry-bridge).
+//
+// Main owns the OS registration and the persisted preference (it must restore
+// the shortcut on a cold launch without the renderer ever visiting Settings),
+// same authority split as keep-awake. Registration failure is surfaced, never
+// swallowed: a chord another app already owns comes back as `error: 'taken'`.
+const QUICK_ENTRY_CONFIG_PATH = path.join(app.getPath('userData'), 'quick-entry.json')
+
+let quickEntryWindow = null
+
+// Latest state push from the primary renderer (connection + recent sessions),
+// replayed to a quick window that spawns after the push happened.
+let quickEntryLastState = null
+
+function readQuickEntrySettings() {
+  try {
+    return sanitizeQuickEntrySettings(JSON.parse(fs.readFileSync(QUICK_ENTRY_CONFIG_PATH, 'utf8')))
+  } catch {
+    // Missing / unreadable / malformed → shipped defaults (enabled, default chord).
+    return sanitizeQuickEntrySettings(undefined)
+  }
+}
+
+function writeQuickEntrySettings(settings) {
+  try {
+    fs.mkdirSync(path.dirname(QUICK_ENTRY_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(QUICK_ENTRY_CONFIG_PATH, JSON.stringify(settings, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[quick-entry] write failed: ${error.message}`)
+  }
+}
+
+function quickEntryUrl() {
+  if (DEV_SERVER) {
+    return `${DEV_SERVER.endsWith('/') ? DEV_SERVER.slice(0, -1) : DEV_SERVER}/?win=quick#/`
+  }
+
+  return `${pathToFileURL(resolveRendererIndex()).toString()}?win=quick#/`
+}
+
+function spawnQuickEntryWindow() {
+  const cursor = screen.getCursorScreenPoint()
+  const display = screen.getDisplayNearestPoint(cursor)
+  const bounds = quickEntryWindowBounds(display?.workArea)
+
+  const win = new BrowserWindow({
+    ...bounds,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    // Same rationale as the pet overlay: on Windows/Linux keep the helper out
+    // of the taskbar/alt-tab list; on macOS use an NSPanel so the frameless
+    // capture window never becomes the app's cmd-tab anchor.
+    skipTaskbar: !IS_MAC,
+    hasShadow: true,
+    alwaysOnTop: true,
+    type: IS_MAC ? 'panel' : undefined,
+    hiddenInMissionControl: IS_MAC,
+    show: false,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: PRELOAD_PATH,
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      devTools: true
+    }
+  })
+
+  win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
+  win.setHiddenInMissionControl?.(true)
+
+  try {
+    win.setVisibleOnAllWorkspaces(
+      true,
+      IS_MAC ? { visibleOnFullScreen: true, skipTransformProcessType: true } : undefined
+    )
+  } catch {
+    // Not supported everywhere — best effort.
+  }
+
+  // Opts out of global UI zoom for the same reason as the pet overlay: it sizes
+  // its own OS window and a zoomed composer would overflow it.
+  wireCommonWindowHandlers(win, zoomWiringForWindowKind('quickEntry'))
+
+  // Hide on blur. The window must never hold the user's focus captive — losing
+  // focus is the cheapest, least surprising dismiss (matches Spotlight).
+  win.on('blur', () => {
+    if (!win.isDestroyed()) {
+      win.hide()
+    }
+  })
+
+  win.on('closed', () => {
+    if (quickEntryWindow === win) {
+      quickEntryWindow = null
+    }
+  })
+
+  // Replay the last known gateway state as soon as the page can hear it — a
+  // freshly spawned quick window must not sit "disconnected" when the primary
+  // renderer already reported a live gateway.
+  win.webContents.on('did-finish-load', () => {
+    if (!win.isDestroyed() && quickEntryLastState) {
+      win.webContents.send('hermes:quick-entry:state', quickEntryLastState)
+    }
+  })
+
+  loadWindowUrl(win, quickEntryUrl(), 'Quick entry')
+
+  return win
+}
+
+// Move the (already-open) window to the display the cursor is on, so the chord
+// summons it where the user is looking rather than where they last were.
+function repositionQuickEntryWindow(win) {
+  try {
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+    win.setBounds(quickEntryWindowBounds(display?.workArea))
+  } catch (error) {
+    rememberLog(`[quick-entry] reposition failed: ${error.message}`)
+  }
+}
+
+function showQuickEntryWindow() {
+  if (!quickEntryWindow || quickEntryWindow.isDestroyed()) {
+    quickEntryWindow = spawnQuickEntryWindow()
+    quickEntryWindow.once('ready-to-show', () => {
+      if (!quickEntryWindow?.isDestroyed()) {
+        quickEntryWindow.show()
+        quickEntryWindow.focus()
+      }
+    })
+
+    return
+  }
+
+  repositionQuickEntryWindow(quickEntryWindow)
+  quickEntryWindow.show()
+  quickEntryWindow.focus()
+  // Re-summoned: tell the renderer to clear any stale draft and refocus.
+  quickEntryWindow.webContents.send('hermes:quick-entry:shown')
+}
+
+function hideQuickEntryWindow() {
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+    quickEntryWindow.hide()
+  }
+}
+
+// The chord toggles: pressing it while the composer is up puts it away, so one
+// gesture does exactly one thing in both directions.
+function toggleQuickEntryWindow() {
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed() && quickEntryWindow.isVisible()) {
+    hideQuickEntryWindow()
+
+    return
+  }
+
+  showQuickEntryWindow()
+}
+
+const quickEntryShortcut = createQuickEntryShortcut(globalShortcut, toggleQuickEntryWindow)
+
+function applyQuickEntrySettings(settings) {
+  const state = quickEntryShortcut.apply(settings)
+
+  if (!settings.enabled) {
+    // Turning the feature off must not leave an orphan always-on-top window.
+    if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+      quickEntryWindow.close()
+    }
+
+    quickEntryWindow = null
+  }
+
+  if (state.error === 'taken') {
+    rememberLog(`[quick-entry] shortcut ${state.shortcut} is already taken by another application`)
+  } else if (state.error === 'invalid') {
+    rememberLog(`[quick-entry] shortcut ${state.shortcut} is not a valid accelerator`)
+  }
+
+  return { ...state, enabled: settings.enabled }
+}
+
+function closeQuickEntryWindow() {
+  quickEntryShortcut.dispose()
+
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+    quickEntryWindow.close()
+  }
+
+  quickEntryWindow = null
+}
+
 function createWindow() {
   const icon = getAppIconPath()
   const savedWindowState = readWindowState()
@@ -8690,9 +8950,9 @@ function createWindow() {
     show: false,
     backgroundColor: getWindowBackgroundColor(),
     // Shared with the secondary session windows (chatWindowWebPreferences) so
-    // both keep `backgroundThrottling: false` — the chat transcript streams via
-    // a requestAnimationFrame-gated flush that Chromium pauses for blurred
-    // windows, stalling the live answer until refocus. See session-windows.ts.
+    // both keep `backgroundThrottling: false` — the chat transcript uses a
+    // bounded timer flush that Chromium clamps for blurred windows, stalling
+    // the live answer until refocus. See session-windows.ts.
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
@@ -8760,6 +9020,10 @@ function createWindow() {
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('will-leave-full-screen', () => sendWindowStateChanged(false))
   mainWindow.on('leave-full-screen', () => sendWindowStateChanged(false))
+  mainWindow.on('minimize', () => sendWindowStateChanged())
+  mainWindow.on('restore', () => sendWindowStateChanged())
+  mainWindow.on('hide', () => sendWindowStateChanged())
+  mainWindow.on('show', () => sendWindowStateChanged())
 
   // Reopen where the user left off. resized/moved settle once per drag; close is
   // the cross-platform backstop, flushed synchronously before the window is gone.
@@ -8867,11 +9131,7 @@ function createWindow() {
     rememberLog(`[renderer console] ${text} (${src}:${lineNo})`)
   })
 
-  if (DEV_SERVER) {
-    mainWindow.loadURL(DEV_SERVER)
-  } else {
-    mainWindow.loadURL(pathToFileURL(resolveRendererIndex()).toString())
-  }
+  loadWindowUrl(mainWindow, DEV_SERVER || pathToFileURL(resolveRendererIndex()).toString(), 'Renderer')
 
   // Start the Python backend NOW, in parallel with the renderer load — not on
   // did-finish-load. The backend cold boot (spawn → port announce → /api/status)
@@ -8903,6 +9163,8 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   const connectionPromise = backendConnectionState.getPromise()
 
   if (!connectionPromise) {
+    await revalidatePool()
+
     return { ok: true, rebuilt: false }
   }
 
@@ -8910,14 +9172,17 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
   // share this primary connection. Coalesce simultaneous requests so one outage
   // produces one failure observation rather than exhausting the whole streak.
   return remoteRevalidation.run(connectionPromise, async () => {
-    const result = await revalidateRemoteConnection({
-      connectionPromise,
-      currentConnectionPromise: () => backendConnectionState.getPromise(),
-      log: rememberLog,
-      probe: fetchPublicJson,
-      resetConnection: resetHermesConnection,
-      tracker: remoteLiveness
-    })
+    const [result] = await Promise.all([
+      revalidateRemoteConnection({
+        connectionPromise,
+        currentConnectionPromise: () => backendConnectionState.getPromise(),
+        log: rememberLog,
+        probe: fetchPublicJson,
+        resetConnection: resetHermesConnection,
+        tracker: remoteLiveness
+      }),
+      revalidatePool()
+    ])
 
     // A rebuilt SSH connection must also tear down its tunnel/master before the
     // renderer re-dials (which only happens after this handler resolves), so the
@@ -8935,6 +9200,20 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     return result
   })
 })
+
+// Pooled remote descriptors get the same treatment as the primary: they have no
+// child process to signal their host's death, and the renderer's keepalive touch
+// spares them from the idle reaper, so nothing else can retire a dead one.
+function revalidatePool() {
+  return revalidatePooledRemoteBackends({
+    entries: backendPool.entries(),
+    log: rememberLog,
+    probe: fetchPublicJson,
+    stopBackend: stopPoolBackend,
+    tracker: remoteLiveness
+  })
+}
+
 ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   touchPoolBackend(profile)
 
@@ -9561,12 +9840,7 @@ async function fetchProfilesSessionSlice(searchParams, remoteProfiles) {
       return remoteSessionList(requested, searchParams)
     }
 
-    const primary = await ensureBackend(null)
-
-    return fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-      method: 'GET',
-      timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-    }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))
+    return fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)
   }
 
   return mergeRemoteProfileSessions(searchParams, remoteProfiles)
@@ -9581,12 +9855,7 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
   const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
 
-  const primary = await ensureBackend(null)
-
-  const base = (await fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
-    method: 'GET',
-    timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
-  }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))) as any
+  const base = (await fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)) as any
 
   // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
   // is correct for this page — mirrors the primary's per-profile over-fetch.
@@ -9645,10 +9914,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const connection = await ensureBackend(routeProfile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, {
-    globalRemote: globalRemoteActive(),
-    profileRemoteOverride: profileHasRemoteOverride(profile)
-  })
+  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
 
   const url = `${connection.baseUrl}${requestPath}`
 
@@ -9879,6 +10145,20 @@ ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(Stri
 
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
+// Each renderer reports the turns it has in flight; the quit guard reads the
+// merged picture. Keyed by webContents id so a closed window stops counting.
+const activeWorkByWebContents = new Map<number, ActiveWork>()
+
+ipcMain.on('hermes:active-work', (event, payload) => {
+  const id = event.sender.id
+
+  if (!activeWorkByWebContents.has(id)) {
+    event.sender.once('destroyed', () => activeWorkByWebContents.delete(id))
+  }
+
+  activeWorkByWebContents.set(id, normalizeActiveWork(payload))
+})
+
 ipcMain.on('hermes:titlebar-theme', (_event, payload) => {
   if (!payload || !isHexColor(payload.background) || !isHexColor(payload.foreground)) {
     return
@@ -9953,10 +10233,137 @@ ipcMain.on('hermes:keep-awake', (_event, on) => {
   }
 })
 
+// Quick Entry: the renderer reads the live registration state on settings mount
+// and writes the preference back. Main is authoritative — it owns the OS
+// accelerator — so both handlers return the state that ACTUALLY resulted,
+// including `registered: false` + `error: 'taken'` when another app owns the
+// chord. See electron/quick-entry.ts + store/quick-entry.
+ipcMain.handle('hermes:quick-entry:settings:get', async () => {
+  const settings = readQuickEntrySettings()
+  const state = quickEntryShortcut.current()
+
+  // Ground truth is what the last apply produced; the shortcut we report is the
+  // live one (a saved-but-rejected chord still shows what the user asked for).
+  return {
+    enabled: settings.enabled,
+    error: state.error,
+    registered: state.registered,
+    shortcut: settings.enabled ? state.shortcut : settings.shortcut
+  }
+})
+
+ipcMain.handle('hermes:quick-entry:settings:set', async (_event, patch) => {
+  const current = readQuickEntrySettings()
+
+  const next = sanitizeQuickEntrySettings({
+    enabled: patch?.enabled === undefined ? current.enabled : patch.enabled === true,
+    shortcut: typeof patch?.shortcut === 'string' && patch.shortcut.trim() ? patch.shortcut : current.shortcut
+  })
+
+  writeQuickEntrySettings(next)
+
+  return applyQuickEntrySettings(next)
+})
+
+// Quick window → main → PRIMARY renderer. We never submit here: the renderer
+// owns the one prompt-submit path, and forwarding keeps it that way. The
+// payload is `{ target, text }` — target routing (current chat / a picked
+// session / new) is the renderer's job too.
+ipcMain.on('hermes:quick-entry:submit', (_event, payload) => {
+  hideQuickEntryWindow()
+
+  const text = typeof payload?.text === 'string' ? payload.text.trim() : ''
+
+  if (!text) {
+    return
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    rememberLog('[quick-entry] dropped a submit: no primary window to route it to')
+
+    return
+  }
+
+  // Deliberately does NOT raise/focus the main window — the user asked to fire
+  // a prompt from wherever they were, not to be yanked into the app.
+  mainWindow.webContents.send('hermes:quick-entry:submit', {
+    target: typeof payload?.target === 'string' && payload.target ? payload.target : 'current',
+    text
+  })
+})
+
+// Primary renderer → main → quick window: gateway connection state + the
+// recent-session list for the target picker. Cached so a quick window spawned
+// AFTER the last push still boots from truth instead of "disconnected".
+ipcMain.on('hermes:quick-entry:state', (_event, payload) => {
+  quickEntryLastState = payload ?? null
+
+  if (quickEntryWindow && !quickEntryWindow.isDestroyed()) {
+    quickEntryWindow.webContents.send('hermes:quick-entry:state', payload)
+  }
+})
+
+ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
+
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
   }
+})
+
+// ── Find-in-page (Ctrl/Cmd+F) ─────────────────────────────────────────────
+// The desktop supports multiple BrowserWindows (one primary plus any
+// per-session secondary windows spawned via `hermes:window:openSession`).
+// Find must run against the requesting window, not a global — otherwise
+// Cmd+F pressed in a secondary session window would search the primary
+// and the match counter would report matches the user can't see. Resolve
+// the sender through `BrowserWindow.fromWebContents(event.sender)` and
+// forward `found-in-page` results back to that same sender.
+
+// Lazily-installed forwarder per sender webContents. We track one
+// uninstall fn per webContents id and prune entries when the sender goes
+// away — Electron does not auto-detach webContents listeners on close,
+// so the map is the cleanup path.
+const foundInPageForwarders = new Map<number, () => void>()
+
+function ensureFoundInPageForwarder(sender: Electron.WebContents): void {
+  if (foundInPageForwarders.has(sender.id)) {
+    return
+  }
+
+  const uninstall = installFoundInPageForwarder(sender)
+  foundInPageForwarders.set(sender.id, uninstall)
+
+  sender.once('destroyed', () => {
+    foundInPageForwarders.get(sender.id)?.()
+    foundInPageForwarders.delete(sender.id)
+  })
+}
+
+ipcMain.handle('hermes:find-in-page', (event, query, options) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+
+  if (!win || win.isDestroyed()) {
+    return { count: 0 }
+  }
+
+  ensureFoundInPageForwarder(event.sender)
+  performFind(win.webContents, query, options)
+
+  // The match count arrives asynchronously via `found-in-page`; the
+  // synchronous return value is intentionally `{ count: 0 }` to mirror
+  // Electron's own `findInPage` return semantics (an opaque request id).
+  return { count: 0 }
+})
+
+ipcMain.handle('hermes:stop-find-in-page', event => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+
+  if (!win || win.isDestroyed()) {
+    return
+  }
+
+  stopFind(win.webContents)
 })
 
 ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
@@ -10969,6 +11376,10 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   keepAwake.set(readPersistedKeepAwake())
+  // Quick Entry's global chord — registered on ready so a cold launch restores
+  // it without the renderer visiting Settings. A failed registration is logged
+  // here and surfaced in Settings via the IPC state (never silent).
+  applyQuickEntrySettings(readQuickEntrySettings())
   createWindow()
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.
@@ -11013,7 +11424,58 @@ function configureSpellChecker() {
   }
 }
 
+// Ask before a quit kills a turn in flight. True when the quit was intercepted
+// and the confirmation is on screen; "Quit Anyway" re-enters before-quit with
+// the latch set and falls straight through to the teardown below.
+function heldQuitForActiveWork(event: Electron.Event): boolean {
+  if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
+    return false
+  }
+
+  const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
+  const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+
+  if (!prompt || !parent || parent.isDestroyed()) {
+    return false
+  }
+
+  event.preventDefault()
+  quitPromptOpen = true
+
+  void dialog
+    .showMessageBox(parent, {
+      buttons: ['Keep Running', 'Quit Anyway'],
+      cancelId: 0,
+      defaultId: 0,
+      detail: prompt.detail,
+      message: prompt.message,
+      type: 'question'
+    })
+    .then(({ response }) => {
+      quitPromptOpen = false
+
+      if (response === 1) {
+        quitConfirmedWithActiveWork = true
+        app.quit()
+      }
+    })
+    .catch(() => {
+      // A dialog we can't show must not become a quit we can't perform.
+      quitPromptOpen = false
+      quitConfirmedWithActiveWork = true
+      app.quit()
+    })
+
+  return true
+}
+
 app.on('before-quit', event => {
+  // Runs ahead of every teardown below, so "Keep Running" leaves the app
+  // exactly as it was.
+  if (heldQuitForActiveWork(event)) {
+    return
+  }
+
   if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
     event.preventDefault()
     sshBootstrapCoordinator.cancelAll()
@@ -11046,6 +11508,10 @@ app.on('before-quit', event => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
+
+  // Same for the Quick Entry composer — and release its global accelerator so a
+  // quitting Hermes never keeps another app's chord hostage.
+  closeQuickEntryWindow()
 
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {

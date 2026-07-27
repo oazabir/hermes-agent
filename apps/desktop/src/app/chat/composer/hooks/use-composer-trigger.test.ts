@@ -121,3 +121,68 @@ describe('useComposerTrigger — slash anywhere in the prompt', () => {
     expect(hook.result.current.trigger).toBeNull()
   })
 })
+
+describe('useComposerTrigger — free-text slash arguments', () => {
+  it('keeps a picked /goal command as editable text while retaining subcommand completion', () => {
+    const editor = mountEditor('/go')
+    const goal = item('/goal', 'Commands')
+    const { hook } = mountTrigger(editor, [goal])
+
+    act(() => hook.result.current.refreshTrigger())
+    act(() => hook.result.current.replaceTriggerWithChip(goal))
+
+    expect(composerPlainText(editor)).toBe('/goal ')
+    expect(editor.querySelector('[data-slash-kind]')).toBeNull()
+    expect(hook.result.current.trigger).not.toBeNull()
+  })
+
+  it('does not seal a multi-word /goal into a chip when the option list runs empty', () => {
+    const editor = mountEditor('/goal finish the full prompt')
+    const { hook } = mountTrigger(editor, [])
+
+    act(() => hook.result.current.refreshTrigger())
+
+    expect(hook.result.current.slashFreeTextArgStage).toBe(true)
+    expect(hook.result.current.commitTypedSlashDirective()).toBe(false)
+    expect(composerPlainText(editor)).toBe('/goal finish the full prompt')
+    expect(editor.querySelector('[data-slash-kind]')).toBeNull()
+  })
+
+  it('treats the default highlight as a suggestion until the user arrows to a row', () => {
+    const editor = mountEditor('/goal stat')
+    const { hook } = mountTrigger(editor, [item('/goal status', 'Options')])
+
+    act(() => hook.result.current.refreshTrigger())
+    expect(hook.result.current.triggerActiveExplicit).toBe(false)
+
+    act(() => hook.result.current.moveTriggerActive(1))
+    expect(hook.result.current.triggerActiveExplicit).toBe(true)
+  })
+
+  it('drops a deliberate selection once the query moves on', () => {
+    const editor = mountEditor('/goal stat')
+    const { hook } = mountTrigger(editor, [item('/goal status', 'Options')])
+
+    act(() => hook.result.current.refreshTrigger())
+    act(() => hook.result.current.moveTriggerActive(1))
+
+    renderComposerContents(editor, '/goal start the migration')
+    act(() => hook.result.current.refreshTrigger())
+
+    expect(hook.result.current.triggerActiveExplicit).toBe(false)
+  })
+
+  it('still commits a fully typed finite option as one directive chip', () => {
+    const editor = mountEditor('/personality creative')
+    const { hook } = mountTrigger(editor, [])
+
+    act(() => hook.result.current.refreshTrigger())
+
+    expect(hook.result.current.slashFreeTextArgStage).toBe(false)
+    act(() => {
+      expect(hook.result.current.commitTypedSlashDirective()).toBe(true)
+    })
+    expect(composerPlainText(editor)).toBe('/personality creative ')
+    expect(editor.querySelector('[data-slash-kind]')?.getAttribute('data-ref-text')).toBe('/personality creative')
+  })
+})

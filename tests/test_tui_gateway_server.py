@@ -661,6 +661,61 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     assert seen == [str(profile_home)]
 
 
+def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path):
+    """Agent construction must install the selected profile's secret scope.
+
+    Without it, get_secret() falls through to process os.environ, so a session
+    "switched" to profile X resolves credentials from the LAUNCH profile's
+    .env (#67605 item 2).
+    """
+    import threading
+
+    from agent.secret_scope import current_secret_scope
+
+    profile_home = tmp_path / "profiles" / "grace"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "PROXMOX_TOKEN=grace-secret\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    scopes = []
+    built = threading.Event()
+
+    def _fake_make_agent(*args, **kwargs):
+        scope = current_secret_scope()
+        scopes.append(dict(scope) if scope else None)
+        built.set()
+        return type("Agent", (), {"model": "test"})()
+
+    monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+
+    ready = threading.Event()
+    sid = "test-secret-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "test-secret-key",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert built.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
+
+
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
     """A profile's own terminal.cwd is read from its config.yaml."""
     project = tmp_path / "proj"
@@ -7124,6 +7179,8 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
 
     assert "/status" in pairs
     assert canon["/status"] == "/status"
+    assert "/approvals" in pairs
+    assert resp["result"]["sub"]["/approvals"] == ["manual", "smart", "off"]
 
     assert "/topic" not in pairs
     assert "/approve" not in pairs
@@ -7476,9 +7533,54 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
         "text": "use Postgres",
     }
     assert calls == ["use Postgres"]
-    assert session["inflight_turn"]["user"] == "use Postgres"
+    # The correction is recorded alongside the prompt that started the turn,
+    # never over it — resume must be able to rebuild both bubbles.
+    assert session["inflight_turn"]["user"] == "original request"
+    assert session["inflight_turn"]["corrections"] == ["use Postgres"]
     assert session.get("last_active") is not None
     assert before is None or session["last_active"] >= before
+
+
+def test_session_redirect_records_correction_without_erasing_prompt():
+    """A redirect must not overwrite the turn's original user text.
+
+    The inflight snapshot is the only thing session.resume can replay, so
+    overwriting ``user`` erased the prompt that started the turn and the
+    client repainted the thread with the user's message missing.
+    """
+    session = {}
+    server._start_inflight_turn(session, "remove the session counts")
+    server._append_inflight_delta(session, "Moving.")
+    server._record_inflight_correction(session, "hurry up")
+    server._record_inflight_correction(session, "and the worktree ones")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+
+    assert snapshot["user"] == "remove the session counts"
+    assert snapshot["corrections"] == ["hurry up", "and the worktree ones"]
+
+
+def test_inflight_snapshot_omits_corrections_when_none_recorded():
+    session = {}
+    server._start_inflight_turn(session, "just the prompt")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert "corrections" not in snapshot
+
+
+def test_new_turn_does_not_inherit_prior_turn_corrections():
+    session = {}
+    server._start_inflight_turn(session, "first prompt")
+    server._record_inflight_correction(session, "first correction")
+    server._start_inflight_turn(session, "second prompt")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+
+    assert snapshot["user"] == "second prompt"
+    assert "corrections" not in snapshot
 
 
 def test_session_redirect_queues_during_agent_build_window(monkeypatch):
@@ -13811,6 +13913,30 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
     assert result == "answer"
     assert captured["event"] == "clarify.request"
     assert captured["timeout"] == 42
+    assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
+
+
+def test_clarify_callback_multi_select_hint(monkeypatch):
+    """multi_select=True adds the hint to the payload; the single-select
+    payload shape stays byte-identical to the pre-multi-select protocol
+    (older renderers must never see the extra field)."""
+    captured = {}
+
+    def fake_block(event, sid, payload, timeout=300):
+        captured.update(payload=payload)
+        return "answer"
+
+    monkeypatch.setattr(server, "_block", fake_block)
+    cb = server._agent_cbs("sid-1")["clarify_callback"]
+
+    cb("Pick many", ["a", "b"], multi_select=True)
+    assert captured["payload"] == {
+        "question": "Pick many",
+        "choices": ["a", "b"],
+        "multi_select": True,
+    }
+
+    cb("Pick one", ["a", "b"], multi_select=False)
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 

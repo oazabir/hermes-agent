@@ -4565,10 +4565,14 @@ class TestRunConversation:
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
-        # #34452: the bare "(empty)" sentinel is now replaced by a
-        # user-visible end-of-turn explanation so the failure isn't silent.
+        # The bare "(empty)" sentinel is never delivered for reasoning-only
+        # exhaustion: the labeled reasoning excerpt (which may contain the
+        # answer) replaces it at the terminal. See
+        # test_empty_terminal_reasoning_surface.py; #34452's explainer still
+        # covers the truly-empty case.
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        assert "only internal reasoning" in result["final_response"]
+        assert "reasoning only" in result["final_response"]
         assert result["turn_exit_reason"] == "empty_response_exhausted"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
@@ -4589,9 +4593,12 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        # #34452: explanation replaces the bare "(empty)" sentinel.
+        # Reasoning-only exhaustion delivers the labeled reasoning excerpt
+        # instead of the bare "(empty)" sentinel (see
+        # test_empty_terminal_reasoning_surface.py).
         assert result["final_response"] != "(empty)"
-        assert "No reply:" in result["final_response"]
+        assert "only internal reasoning" in result["final_response"]
+        assert "structured reasoning answer" in result["final_response"]
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
@@ -6605,6 +6612,68 @@ class TestNousCredentialRefresh:
         )
         assert "default_headers" not in rebuilt["kwargs"]
         assert isinstance(agent.client, _RebuiltClient)
+
+    def test_try_refresh_nous_client_credentials_rebuilds_anthropic_client(
+        self, agent, monkeypatch
+    ):
+        """Portal anthropic/* sessions hold an Anthropic client, not OpenAI.
+
+        A 401 on the Messages wire must refresh the invoke JWT into
+        ``_anthropic_api_key`` / ``_anthropic_base_url`` and rebuild that
+        client — swapping only ``agent.client`` would leave the turn stuck
+        on the expired Bearer token.
+        """
+        agent.provider = "nous"
+        agent.api_mode = "anthropic_messages"
+        agent.model = "anthropic/claude-opus-4.8"
+        agent.api_key = "stale-nous-key"
+        agent.base_url = "https://inference-api.nousresearch.com/v1"
+        agent._anthropic_api_key = "stale-nous-key"
+        agent._anthropic_base_url = "https://inference-api.nousresearch.com/v1"
+        agent._client_kwargs = {}
+        agent.client = None
+
+        captured = {}
+        rebuild_calls = {"count": 0}
+
+        class _RebuiltAnthropic:
+            pass
+
+        def _fake_resolve(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": "fresh-portal-jwt",
+                "base_url": "https://inference-api.nousresearch.com/v1",
+            }
+
+        def _fake_rebuild():
+            rebuild_calls["count"] += 1
+            agent._anthropic_client = _RebuiltAnthropic()
+
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_nous_runtime_credentials", _fake_resolve
+        )
+        monkeypatch.setattr(agent, "_rebuild_anthropic_client", _fake_rebuild)
+        monkeypatch.setattr(
+            agent,
+            "_replace_primary_openai_client",
+            MagicMock(side_effect=AssertionError("OpenAI client must not be rebuilt")),
+        )
+
+        ok = agent._try_refresh_nous_client_credentials(force=True)
+
+        assert ok is True
+        assert captured["force_refresh"] is True
+        assert agent.api_key == "fresh-portal-jwt"
+        assert agent.base_url == "https://inference-api.nousresearch.com/v1"
+        assert agent._anthropic_api_key == "fresh-portal-jwt"
+        assert agent._anthropic_base_url == (
+            "https://inference-api.nousresearch.com/v1"
+        )
+        assert rebuild_calls["count"] == 1
+        assert isinstance(agent._anthropic_client, _RebuiltAnthropic)
+        assert agent.client is None
+        agent._replace_primary_openai_client.assert_not_called()
 
 
 class TestCredentialPoolRecovery:

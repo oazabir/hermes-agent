@@ -445,6 +445,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -1303,13 +1304,49 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             return None
 
 
+def _resolve_workspace_key() -> Optional[str]:
+    """The current workspace identity for cwd-scoped resume.
+
+    Git repo root when CWD is inside a repo (so all sessions across its
+    subdirs/worktrees group together), else the CWD itself. Returns None when
+    neither can be determined — callers fall back to the global MRU then.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
+
+
 def _resolve_last_session(source: str = "cli") -> Optional[str]:
-    """Look up the most recently-used session ID for a source."""
+    """Look up the most recently-used session ID for a source.
+
+    Scoped to the current workspace first (git repo root, else cwd) so
+    ``hermes -c`` from repo A continues repo A's last session rather than the
+    global MRU. Falls back to the unscoped MRU when no session matches the
+    current workspace, preserving the old behaviour for fresh directories.
+    """
     db = None
     try:
         from hermes_state import SessionDB
 
         db = SessionDB()
+        ws_key = _resolve_workspace_key()
+        if ws_key:
+            sessions = db.search_sessions(source=source, limit=1, workspace_key=ws_key)
+            if sessions:
+                return sessions[0]["id"]
+        # Fallback: global MRU for this source.
         sessions = db.search_sessions(source=source, limit=1)
         return sessions[0]["id"] if sessions else None
     except Exception:
@@ -4558,6 +4595,16 @@ def cmd_security(args):
     sys.exit(2)
 
 
+def cmd_approvals(args):
+    """Dispatch `hermes approvals <subcmd>`."""
+    from hermes_cli.approvals_suggest import approvals_command
+
+    status = approvals_command(args)
+    if status:
+        sys.exit(status)
+    return status
+
+
 def cmd_dump(args):
     """Dump setup summary for support/debugging."""
     from hermes_cli.dump import run_dump
@@ -4711,6 +4758,108 @@ def _clear_bytecode_cache(root: Path) -> int:
                 pass
             dirnames.clear()  # nothing left to recurse into
     return removed
+
+
+_UPDATE_RUNTIME_RELOAD_MODULES = (
+    "hermes_constants",
+    "tools.environments.local",
+    "tools.lazy_deps",
+)
+
+
+def _reload_updated_runtime_modules() -> None:
+    """Reload update-sensitive modules after the checkout changes in-place.
+
+    ``hermes update`` keeps running in the pre-pull Python process. After a
+    large update, modules already present in ``sys.modules`` can still expose
+    old symbols even though their source files on disk are new. Refresh the
+    small module set used by lazy-backend refresh before that step imports
+    newly-updated code paths.
+    """
+    try:
+        import importlib
+
+        importlib.invalidate_caches()
+        for module_name in _UPDATE_RUNTIME_RELOAD_MODULES:
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            try:
+                importlib.reload(module)
+            except Exception as exc:
+                logger.debug("Could not reload updated module %s: %s", module_name, exc)
+    except Exception as exc:
+        logger.debug("Could not refresh update runtime modules: %s", exc)
+
+
+# Stamp file recording the checkout fingerprint the bytecode cache was last
+# validated against. Lives next to the checkout (NOT in HERMES_HOME) because
+# __pycache__ is per-checkout state shared by every profile.
+_BYTECODE_FINGERPRINT_FILE = ".bytecode-fingerprint"
+
+
+def _record_bytecode_fingerprint() -> None:
+    """Persist the current checkout fingerprint after a bytecode sweep.
+
+    Never raises. A failed write just means the next launch re-sweeps —
+    safe, merely redundant.
+    """
+    try:
+        fingerprint = _read_git_revision_fingerprint(PROJECT_ROOT)
+        if not fingerprint:
+            return
+        stamp_path = PROJECT_ROOT / _BYTECODE_FINGERPRINT_FILE
+        tmp_path = stamp_path.with_name(stamp_path.name + ".tmp")
+        tmp_path.write_text(fingerprint, encoding="utf-8")
+        tmp_path.replace(stamp_path)
+    except OSError as exc:
+        logger.debug("Could not record bytecode fingerprint: %s", exc)
+
+
+def _sweep_stale_bytecode_if_checkout_changed() -> None:
+    """Clear ``__pycache__`` at launch when the checkout changed underneath us.
+
+    The stale-bytecode bug class (issues #6207, #60242; Dhruv's WhatsApp
+    ``cannot import name 'parse_model_flags_detailed'`` report) has one
+    shared shape: the checkout's ``.py`` files change (git pull inside
+    ``hermes update``, a manual ``git pull``, a ZIP update, a file-sync
+    restore) while ``__pycache__`` retains bytecode from the previous
+    revision, and a later process trusts the stale ``.pyc`` instead of the
+    fresh source.
+
+    Update-time clears alone can never close this class: ``hermes update``
+    always executes the PRE-pull updater code, so any hardening added to it
+    only takes effect one update late, and manual ``git pull`` never runs
+    the updater at all. This launch-time guard closes the loop: every
+    ``hermes`` entry point compares the checkout fingerprint (cheap file
+    reads, no git subprocess) against the last-validated stamp and sweeps
+    the bytecode cache once when they diverge.
+
+    Never raises — a failure here must not block launch.
+    """
+    try:
+        fingerprint = _read_git_revision_fingerprint(PROJECT_ROOT)
+        if not fingerprint:
+            return  # non-git install — the ZIP update path clears explicitly
+        stamp_path = PROJECT_ROOT / _BYTECODE_FINGERPRINT_FILE
+        try:
+            recorded = stamp_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        if recorded == fingerprint:
+            return
+        removed = _clear_bytecode_cache(PROJECT_ROOT)
+        if removed:
+            logger.info(
+                "Checkout changed since last launch (%s -> %s): cleared %d stale __pycache__ director%s",
+                recorded or "unknown",
+                fingerprint,
+                removed,
+                "y" if removed == 1 else "ies",
+            )
+        _record_bytecode_fingerprint()
+    except Exception as exc:
+        logger.debug("Stale-bytecode launch sweep failed: %s", exc)
 
 
 # Critical files that Hermes must be able to import immediately after an
@@ -5179,6 +5328,62 @@ def _run_npm_install_deterministic(
     )
 
 
+def _npm_bin_exists(bin_dir: Path, name: str) -> bool:
+    """True when an npm bin shim for *name* exists (POSIX or Windows)."""
+    return any(
+        (bin_dir / candidate).exists()
+        for candidate in (name, f"{name}.cmd", f"{name}.ps1", f"{name}.exe")
+    )
+
+
+def _web_build_toolchain_ready(*roots: Path) -> bool:
+    """True when ``tsc`` and ``vite`` shims are reachable from any of *roots*.
+
+    Callers must pass every root the build would search; checking only one
+    reports a healthy tree as broken.
+    """
+    bin_dirs = [
+        bin_dir
+        for bin_dir in (root / "node_modules" / ".bin" for root in roots)
+        if bin_dir.is_dir()
+    ]
+    return bool(bin_dirs) and all(
+        any(_npm_bin_exists(bin_dir, tool) for bin_dir in bin_dirs)
+        for tool in ("tsc", "vite")
+    )
+
+
+def _web_toolchain_roots(web_dir: Path) -> tuple[Path, ...]:
+    """Roots whose ``node_modules/.bin`` can satisfy the web build.
+
+    ``npm run build`` prepends ``node_modules/.bin`` for the package and each
+    of its ancestors, so shims hoisted to the workspace root and shims nested
+    under a package that owns its lockfile (#42973) are equally valid.
+    """
+    return (web_dir, web_dir.parent)
+
+
+def _missing_web_build_tool(output: str) -> str | None:
+    """Return the build tool a failed ``npm run build`` could not resolve.
+
+    Each shell words this differently: ``sh: 1: tsc: not found`` (dash),
+    ``vite: command not found`` (bash/zsh), and ``'tsc' is not recognized as
+    an internal or external command`` (cmd.exe).
+    """
+    lowered = output.lower()
+    for tool in ("tsc", "vite"):
+        if any(
+            phrase in lowered
+            for phrase in (
+                f"{tool}: not found",
+                f"{tool}: command not found",
+                f"'{tool}' is not recognized",
+            )
+        ):
+            return tool
+    return None
+
+
 def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """Build the web UI frontend if npm is available, serializing across processes.
 
@@ -5286,12 +5491,16 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     npm_workspace_args: tuple[str, ...] = () if npm_cwd == web_dir else ("--workspace", "web")
     if _is_termux_startup_environment():
         npm_cwd, npm_workspace_args = _termux_workspace_install_context(web_dir)
-    r1 = _run_npm_install_deterministic(
-        npm,
-        npm_cwd,
-        extra_args=(*npm_workspace_args, "--silent"),
-        env=build_env,
-    )
+
+    def _install_web_deps(*, silent: bool) -> "subprocess.CompletedProcess":
+        return _run_npm_install_deterministic(
+            npm,
+            npm_cwd,
+            extra_args=(*npm_workspace_args, "--silent") if silent else npm_workspace_args,
+            env=build_env,
+        )
+
+    r1 = _install_web_deps(silent=True)
     if r1.returncode != 0:
         _say(
             f"  {'✗' if fatal else '⚠'} Web UI npm install failed"
@@ -5308,11 +5517,22 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # recoverable (the stale-dist fallback below handles the kill path).
     r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
     if r2.returncode != 0:
-        # Retry once after a short delay — covers boot-time races on Windows
-        # (antivirus scanning Node.js binaries, npm cache not ready, transient
-        # I/O when launched via Scheduled Task at logon). See issue #23817.
-        _time.sleep(3)
-        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+        # The install above can exit 0 while leaving the tree without a build
+        # toolchain — a lockfile-hash skip over a half-installed tree, or an
+        # interrupted link step. The generic retry below just reruns the same
+        # command, so `tsc: not found` survives it and the stale dist is
+        # served forever. Reinstall (non-silent, so the user sees it) first.
+        missing_tool = _missing_web_build_tool((r2.stdout or "") + (r2.stderr or ""))
+        if missing_tool:
+            _say(f"  ⚠ Build could not resolve {missing_tool} — reinstalling web dependencies...")
+            _install_web_deps(silent=False)
+            r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+        if r2.returncode != 0:
+            # Retry once after a short delay — covers boot-time races on Windows
+            # (antivirus scanning Node.js binaries, npm cache not ready, transient
+            # I/O when launched via Scheduled Task at logon). See issue #23817.
+            _time.sleep(3)
+            r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
 
     if r2.returncode != 0:
         # _run_with_idle_timeout merges stderr into stdout; older callers
@@ -7660,6 +7880,7 @@ def _update_via_zip(args):
         print(
             f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
         )
+    _record_bytecode_fingerprint()
 
     # Reinstall Python dependencies. Prefer .[all], but if one optional extra
     # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -7701,6 +7922,11 @@ def _update_via_zip(args):
                 check=True,
             )
         _install_python_dependencies_with_optional_fallback(pip_cmd)
+
+    # ZIP path parity: heal the active memory provider's bridge packages
+    # after the dependency reinstall, same as the git-pull path (#53272,
+    # #70636).
+    _refresh_active_memory_provider_dependencies()
 
     node_failures = _update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
@@ -9530,6 +9756,55 @@ def _refresh_active_lazy_features(
     return False
 
 
+def _refresh_active_memory_provider_dependencies() -> None:
+    """Refresh pip dependencies for the configured external memory provider.
+
+    Memory-provider bridge packages are declared in each provider's
+    ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
+    ``hindsight-all``), NOT in Hermes' editable-install extras or
+    ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
+    or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
+    provider's declared install for the ACTIVE provider only, after the
+    core install and lazy refresh, so the last write to any shared package
+    is the one the active provider needs.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (config load failed): %s", exc)
+        return
+
+    provider = ""
+    if isinstance(cfg, dict):
+        memory_cfg = cfg.get("memory")
+        if isinstance(memory_cfg, dict):
+            if memory_cfg.get("enabled") is False:
+                return
+            provider = str(memory_cfg.get("provider") or "").strip()
+
+    # "default" / empty is the built-in file-backed store — no pip deps.
+    if not provider or provider in {"default", "builtin", "none"}:
+        return
+
+    try:
+        from hermes_cli.memory_setup import _install_dependencies
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (import failed): %s", exc)
+        return
+
+    print()
+    print(f"→ Refreshing active memory provider dependencies ({provider})...")
+
+    try:
+        _install_dependencies(provider, force=True)
+    except Exception as exc:
+        print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -10038,6 +10313,15 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     # Also check that node_modules exists; a matching hash with missing
     # node_modules means the cache was recorded by another checkout.
     if not (PROJECT_ROOT / "node_modules").is_dir():
+        return True
+    # A matching lockfile hash over a tree whose web build toolchain never
+    # landed must NOT skip the reinstall — otherwise every later `hermes
+    # update` keeps rebuilding against a half-installed tree and serving a
+    # stale dist.
+    web_dir = PROJECT_ROOT / "web"
+    if (web_dir / "package.json").is_file() and not _web_build_toolchain_ready(
+        *_web_toolchain_roots(web_dir)
+    ):
         return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
@@ -11414,6 +11698,36 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("    sudo systemctl restart <unit>     # system-scope")
 
 
+def _refresh_windows_gateway_launchers() -> None:
+    """Regenerate installed Windows gateway launcher scripts after update.
+
+    The Scheduled Task / Startup-folder launchers (``gateway.cmd`` +
+    ``gateway.vbs``) are persistence artifacts written once at install time —
+    ``hermes update`` never touched them, so installs created before the
+    hidden-console rework (aa2ae36c3f) kept launching the gateway through
+    ``pythonw.exe`` forever: every descendant spawn flashed a conhost
+    (#54220/#56747) and, since #70344, the console-less gateway died at
+    startup with ``RuntimeError: sys.stderr is None`` (#71671).
+
+    The task's /TR points at a stable script path, so rewriting the files in
+    place retargets the task without any schtasks call (no UAC needed).
+    ``_write_task_script`` is idempotent and renders from current code, so
+    this is a no-op for modern installs. Best-effort: a failed refresh must
+    never fail the update.
+    """
+    if not _is_windows():
+        return
+    try:
+        from hermes_cli import gateway_windows
+
+        if not gateway_windows.is_installed():
+            return
+        gateway_windows._write_task_script()
+        print("  ✓ Refreshed Windows gateway launcher scripts")
+    except Exception as exc:
+        logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)
+
+
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
@@ -11421,6 +11735,11 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     token["resume_needed"] = False
     if not _is_windows():
         return
+
+    # Regenerate the persisted launcher scripts before respawning anything,
+    # so a legacy pythonw-era Scheduled Task / Startup entry comes back on
+    # the current hidden-console design at the next login too.
+    _refresh_windows_gateway_launchers()
 
     profiles = token.get("profiles") or {}
     unmapped = token.get("unmapped") or []
@@ -12060,6 +12379,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
+        _record_bytecode_fingerprint()
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
@@ -12137,6 +12457,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # based on a narrow 7-package import probe (#58004 review).
         _clear_update_incomplete_marker()
 
+        # The update process is still the old Python interpreter process. Run
+        # one final cache/module refresh immediately before lazy backend
+        # refresh, which imports newly-pulled modules that may depend on fresh
+        # symbols in hermes_constants or lazy_deps. The dependency install
+        # above may also have regenerated bytecode from build-cache copies —
+        # this second sweep catches those stragglers (#60242, #65240).
+        removed = _clear_bytecode_cache(PROJECT_ROOT)
+        if removed:
+            print(
+                f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
+            )
+        _record_bytecode_fingerprint()
+        _reload_updated_runtime_modules()
+
         # Upgrade pip before lazy refreshes — stale pip can fail source builds
         # and leave partially-written packages (#57828).
         _write_lazy_refresh_incomplete_marker()
@@ -12152,6 +12486,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "  ⚠ Lazy-refresh recovery incomplete — run `hermes` again "
                 "to finish import-based venv repair."
             )
+
+        # Heal the active memory provider's bridge packages last — the core
+        # reinstall + lazy refresh above may have stripped or downgraded
+        # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
+        _refresh_active_memory_provider_dependencies()
 
         node_failures = _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
@@ -12289,18 +12628,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("  ✓ Model catalog cache refreshed from checkout")
         except Exception as e:
             logger.debug("Model catalog seed during update failed: %s", e)
-
-        # After git pull, source files on disk are newer than cached Python
-        # modules in this process.  Reload hermes_constants so that any lazy
-        # import executed below (skills sync, gateway restart) sees new
-        # attributes like display_hermes_home() added since the last release.
-        try:
-            import importlib
-            import hermes_constants as _hc
-
-            importlib.reload(_hc)
-        except Exception:
-            pass  # non-fatal — worst case a lazy import fails gracefully
 
         # Sync bundled skills (copies new, updates changed, respects user deletions)
         try:
@@ -14816,7 +15143,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
@@ -15333,6 +15660,12 @@ def main():
     except Exception:
         pass
 
+    # If the checkout changed since the last launch (hermes update, manual
+    # git pull, old-updater update that predates newer clears), sweep stale
+    # __pycache__ once so no process — this one's lazy imports included —
+    # resolves fresh source against old bytecode. Never raises.
+    _sweep_stale_bytecode_if_checkout_changed()
+
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
     # *running* update — that flow writes and clears its own marker, and we
@@ -15656,6 +15989,11 @@ def main():
     # security command  (parser built in hermes_cli/subcommands/security.py)
     # =========================================================================
     build_security_parser(subparsers, cmd_security=cmd_security)
+
+    # =========================================================================
+    # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
+    # =========================================================================
+    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
 
     # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)
@@ -16091,7 +16429,7 @@ def main():
         p.add_argument(
             "--newer-than",
             metavar="AGE",
-            help="Only match sessions started within the last AGE "
+            help="Only match sessions active within the last AGE "
             "(e.g. '5h', '2d') or after an ISO timestamp",
         )
         p.add_argument(
@@ -17248,12 +17586,14 @@ def main():
                 print(f"No sessions match ({describe_filters(filters)}).")
                 return
 
-            # Candidates are ordered oldest-first — surface the age span so
-            # the confirmation makes the blast radius obvious.
-            _oldest = candidates[0].get("started_at")
-            _newest = candidates[-1].get("started_at")
+            # Candidates are ordered by activity oldest-first. Surface that
+            # span so a long-lived but recently used conversation cannot look
+            # old merely because of its creation date.
+            _oldest = candidates[0].get("last_active")
+            _newest = candidates[-1].get("last_active")
             _span = (
-                f"oldest {format_epoch(_oldest)}, newest {format_epoch(_newest)}"
+                f"oldest activity {format_epoch(_oldest)}, "
+                f"newest activity {format_epoch(_newest)}"
             )
 
             if args.dry_run or not args.yes:
@@ -17266,7 +17606,7 @@ def main():
                     title = (s.get("title") or "")[:36]
                     model = (s.get("model") or "-").split("/")[-1][:24]
                     print(
-                        f"  {s['id']}  {format_epoch(s['started_at']):<17} "
+                        f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
                         f"{s['source']:<10} {model:<24} "
                         f"{s['message_count']:>4} msgs  {title}"
                     )
