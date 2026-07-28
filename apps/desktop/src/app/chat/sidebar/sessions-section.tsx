@@ -14,7 +14,7 @@ import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 
-import { SidebarCount, SidebarDateDivider } from './chrome'
+import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import {
   EnteredProjectContent,
   ProjectOverviewRow,
@@ -56,7 +56,7 @@ function SidebarSectionHeader({
     <>
       {icon}
       <SidebarPanelLabel>{label}</SidebarPanelLabel>
-      {meta && <SidebarCount>{meta}</SidebarCount>}
+      {meta && <SidebarSectionMeta>{meta}</SidebarSectionMeta>}
     </>
   )
 
@@ -197,7 +197,14 @@ export function SidebarSessionsSection({
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
   const hasProjectOverview = Boolean(projectOverview?.length)
-  const hasProjectContent = Boolean(projectContent && projectContent.sessionCount > 0)
+
+  // Lanes count as content even with no rows left in them: the backend only
+  // emits a lane that has sessions, so a lane surviving with zero rows means
+  // they were filtered out (pinned) — the branch is real and must still render.
+  // A genuinely empty project has no lanes at all and keeps its empty state.
+  const hasProjectContent = Boolean(
+    projectContent && (projectContent.sessionCount > 0 || projectContent.repos.some(repo => repo.groups.length > 0))
+  )
 
   const showEmptyState =
     forceEmptyState || (!hasGroupedSessions && !hasProjectOverview && !hasProjectContent && sessions.length === 0)

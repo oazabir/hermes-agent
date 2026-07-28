@@ -887,8 +887,10 @@ def init_agent(
     # report cumulative micros spent.  Surfaced behind HERMES_DEV_CREDITS.
     agent._credits_state = None
     agent._credits_session_start_micros = None
-    # Threshold-notice latch (L4): active sticky-notice keys + the warn90 crossing gate.
-    agent._credits_latch = {"active": set(), "seen_below_90": False, "usage_band": None}
+    # Threshold-notice latch (L4): active sticky-notice keys + the crossing gates.
+    from agent.credits_tracker import new_credits_latch
+
+    agent._credits_latch = new_credits_latch()
 
     # OpenRouter response cache hit counter — incremented when
     # X-OpenRouter-Cache-Status: HIT is seen in streaming response headers.
@@ -957,12 +959,6 @@ def init_agent(
     agent._stream_writer_token = 0
     agent._stream_writer_tls = threading.local()
     agent._stream_writer_dropped = 0
-
-    # Displayed reasoning text streamed during the current model response,
-    # captured only when a surface consumed it via a reasoning callback. Used
-    # by active-turn redirect to checkpoint what the user actually saw without
-    # ever persisting hidden provider reasoning.
-    agent._current_streamed_reasoning_text = ""
 
     # Optional current-turn user-message override used when the API-facing
     # user message intentionally differs from the persisted transcript
@@ -1162,6 +1158,10 @@ def init_agent(
             elif base_url_host_matches(effective_base, "chatgpt.com"):
                 from agent.auxiliary_client import _codex_cloudflare_headers
                 client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
+            elif base_url_host_matches(effective_base, "x.ai"):
+                from tools.xai_http import hermes_xai_default_headers
+
+                client_kwargs["default_headers"] = hermes_xai_default_headers()
             elif "default_headers" not in client_kwargs:
                 # Fall back to profile.default_headers for providers that
                 # declare custom headers (e.g. Kimi User-Agent on non-kimi.com
@@ -2278,7 +2278,18 @@ def init_agent(
     # AFTER the custom_providers branch so per-model overrides aren't lost.
     agent._config_context_length = _config_context_length
 
-    agent._ensure_lmstudio_runtime_loaded(_config_context_length)
+    _lmstudio_runtime_context_length = agent._ensure_lmstudio_runtime_loaded(
+        _config_context_length
+    )
+    if agent._lmstudio_load_was_unverified(_lmstudio_runtime_context_length):
+        _ra().logger.warning(
+            "LM Studio model activation was rejected or completed without a "
+            "verifiable active context length; falling back to configured context"
+        )
+    _effective_context_length = agent._effective_lmstudio_context_length(
+        _config_context_length,
+        _lmstudio_runtime_context_length,
+    )
 
 
 
@@ -2355,7 +2366,7 @@ def init_agent(
             agent.model,
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),
-            config_context_length=_config_context_length,
+            config_context_length=_effective_context_length,
             provider=agent.provider,
             custom_providers=_custom_providers,
         )
@@ -2390,7 +2401,7 @@ def init_agent(
             quiet_mode=agent.quiet_mode,
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),
-            config_context_length=_config_context_length,
+            config_context_length=_effective_context_length,
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
@@ -2419,7 +2430,13 @@ def init_agent(
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).
     _ctx = getattr(agent.context_compressor, "context_length", 0)
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
+    _allow_lmstudio_explicit_below_floor = (
+        str(getattr(agent, "provider", "") or "").strip().lower() == "lmstudio"
+        and isinstance(agent._config_context_length, int)
+        and not isinstance(agent._config_context_length, bool)
+        and agent._config_context_length > 0
+    )
+    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
