@@ -130,6 +130,7 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import { buildSessionByAnyId } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
@@ -384,34 +385,21 @@ export function ChatSidebar({
     [sessions, showAllProfiles, profileScope]
   )
 
-  // Agent session order is pinned to creation time (started_at), NOT activity —
-  // a new message must never float a session to the top. Position only changes
-  // for a brand-new session or an explicit manual drag (agentOrderIds).
+  // Recents by activity (last_active || started_at). User send stamps
+  // last_active immediately; manual drag order still wins below.
   const sortedSessions = useMemo(
-    () => [...visibleSessions].sort((a, b) => (b.started_at || 0) - (a.started_at || 0)),
+    () => [...visibleSessions].sort((a, b) => sessionTime(b) - sessionTime(a)),
     [visibleSessions]
   )
 
   const workingSessionIdSet = useMemo(() => new Set(workingSessionIds), [workingSessionIds])
 
-  // Index sessions by both their live id and their lineage-root id so a pin
-  // stored as the pre-compression root resolves to the live continuation tip.
-  const sessionByAnyId = useMemo(() => {
-    const map = new Map<string, SessionInfo>()
-
-    // Cron sessions are listed separately but can still be pinned, so index
-    // them too — otherwise a pinned cron job can't resolve into the Pinned
-    // section. Recents take precedence on id collisions (set last).
-    for (const s of [...cronSessions, ...visibleSessions]) {
-      map.set(s.id, s)
-
-      if (s._lineage_root_id && !map.has(s._lineage_root_id)) {
-        map.set(s._lineage_root_id, s)
-      }
-    }
-
-    return map
-  }, [visibleSessions, cronSessions])
+  // Index sessions by every id a pin might be stored under — recents, cron,
+  // AND messaging, since all three can be pinned (see session-index.ts).
+  const sessionByAnyId = useMemo(
+    () => buildSessionByAnyId(visibleSessions, cronSessions, messagingSessions),
+    [visibleSessions, cronSessions, messagingSessions]
+  )
 
   const pinnedSessions = useMemo(() => {
     const seen = new Set<string>()

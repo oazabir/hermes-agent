@@ -225,6 +225,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_RUN_ID",
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
+    # Pytest is routinely launched from a delegated worker.  The worker
+    # lineage marker must not make parent-state tests run as delegated
+    # children; tests that exercise child behavior set it explicitly.
+    "HERMES_DELEGATED_CHILD_CONTEXT",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
@@ -265,6 +269,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DINGTALK_ALLOWED_USERS",
     "FEISHU_ALLOWED_USERS",
     "WECOM_ALLOWED_USERS",
+    "PHOTON_ALLOWED_USERS",
     "GATEWAY_ALLOWED_USERS",
     "GATEWAY_ALLOW_ALL_USERS",
     "TELEGRAM_ALLOW_ALL_USERS",
@@ -274,6 +279,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "SIGNAL_ALLOW_ALL_USERS",
     "EMAIL_ALLOW_ALL_USERS",
     "SMS_ALLOW_ALL_USERS",
+    "PHOTON_ALLOW_ALL_USERS",
     # Gateway home channels are set by /sethome in real profiles. Tests that
     # exercise dashboard notification toggles must opt in explicitly or they
     # can accidentally subscribe against a developer's real home channel.
@@ -314,6 +320,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WECOM_HOME_CHANNEL",
     "WECOM_HOME_CHANNEL_THREAD_ID",
     "WECOM_HOME_CHANNEL_NAME",
+    "PHOTON_HOME_CHANNEL",
+    "PHOTON_HOME_CHANNEL_THREAD_ID",
+    "PHOTON_HOME_CHANNEL_NAME",
     # API server bind/auth settings are common in local gateway profiles and
     # change adapter defaults plus load_gateway_config() enablement. Tests that
     # need them set opt in explicitly with monkeypatch.
@@ -1079,3 +1088,38 @@ def _audio_playback_guard(request, monkeypatch):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_computer_use_approval_state():
+    """Reset computer-use approval globals after every test.
+
+    ``tools.computer_use.tool`` keeps three module-globals for the CLI
+    approval flow: ``_approval_callback`` (set by the CLI console on init)
+    plus the per-session unlock stores ``_always_allow`` /
+    ``_session_auto_approve``. A test that installs a callback — or drives
+    CLI init far enough that the real one is registered — and does not reset
+    it poisons every later computer-use test in the same process:
+
+    * a leaked callback that raises (dead UI/queue infra, or a stale
+      two-argument signature — the real contract is ``(action, args,
+      summary)``) turns into ``verdict = "deny"`` in ``_request_approval``,
+      so dispatch tests fail with an empty backend call list;
+    * a leaked callback that blocks (the real CLI one waits on an answer
+      queue) hangs the whole single-process run forever — pytest-timeout is
+      the only thing that can cut it.
+
+    Both symptoms are order-dependent: the affected files pass in isolation
+    and only fail in full-suite runs. Teardown-only, so tests that install
+    their own callback keep it for their own duration.
+    """
+    yield
+    try:
+        from tools.computer_use import tool as _cu_tool
+
+        _cu_tool.set_approval_callback(None)
+        with _cu_tool._approval_lock:
+            _cu_tool._always_allow.clear()
+            _cu_tool._session_auto_approve.clear()
+    except Exception:
+        pass

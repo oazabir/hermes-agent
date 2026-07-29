@@ -30,12 +30,14 @@ Usage::
 import logging
 import os
 import platform
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -126,7 +128,7 @@ LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
 # Known model sets for auto-correction
-OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
+OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
 
 # Singleton for the local model — loaded once, reused across calls
@@ -652,13 +654,43 @@ def _terminate_command_stt_process_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProcess:
-    """Run a command-provider shell command with process-tree timeout cleanup.
+def _command_stt_env_passthrough(config: Dict[str, Any]) -> list:
+    """Return the provider's ``env_passthrough`` allowlist (opt-out of scrub).
 
-    Mirrors ``tools.tts_tool._run_command_tts``.
+    Command providers legitimately reference their own API keys in the shell
+    template (curl one-liners). The child env is scrubbed of Hermes secrets by
+    default; ``env_passthrough: [MY_API_KEY, ...]`` copies the named variables
+    back from the parent environment so a trusted template keeps working.
+    Mirrors ``tools.tts_tool._command_provider_env_passthrough``.
+    """
+    raw = config.get("env_passthrough")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _run_command_stt(
+    command: str,
+    timeout: float,
+    env_passthrough: Optional[list] = None,
+) -> subprocess.CompletedProcess:
+    """Run a command-provider shell command with process-tree idle cleanup.
+
+    Mirrors ``tools.tts_tool._run_command_tts``: ``timeout`` is an IDLE
+    timeout, reset whenever the command emits output on stdout/stderr —
+    a slow-but-alive provider survives, a silently stalled one is killed
+    (same progress-based stuck detection as the TTS runner, #50081).
+    Child env is scrubbed of Hermes secrets (salvage of #56332) while still
+    propagating delegated-child lineage markers when applicable.
     """
     from agent.delegation_context import delegated_child_subprocess_env
+    from tools.environments.local import hermes_subprocess_env
 
+    scrubbed = hermes_subprocess_env(inherit_credentials=False)
+    for key in env_passthrough or []:
+        value = os.environ.get(key)
+        if value is not None:
+            scrubbed[key] = value
     popen_kwargs: Dict[str, Any] = {
         "shell": True,
         "stdout": subprocess.PIPE,
@@ -668,7 +700,7 @@ def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProces
         # must not raise in the reader threads on non-UTF-8 Windows (#45099).
         "encoding": "utf-8",
         "errors": "replace",
-        "env": delegated_child_subprocess_env(),
+        "env": delegated_child_subprocess_env(scrubbed),
     }
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -676,21 +708,89 @@ def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProces
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(command, **popen_kwargs, stdin=subprocess.DEVNULL)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _terminate_command_stt_process_tree(proc)
+    output_queue: "queue.Queue[tuple[str, Optional[str]]]" = queue.Queue()
+    chunks: Dict[str, list] = {"stdout": [], "stderr": []}
+    open_streams = {"stdout", "stderr"}
+
+    def read_stream(name: str, stream: Any) -> None:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        read1 = getattr(getattr(stream, "buffer", None), "read1", None)
         try:
-            stdout, stderr = proc.communicate(timeout=1)
-        except Exception:
-            stdout = getattr(exc, "output", None)
-            stderr = getattr(exc, "stderr", None)
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout,
-            output=stdout,
-            stderr=stderr,
-        ) from exc
+            while True:
+                if read1 is None:
+                    chunk = stream.read(65536)
+                else:
+                    data = read1(65536)
+                    chunk = data.decode(encoding, errors="replace")
+                if not chunk:
+                    break
+                output_queue.put((name, chunk))
+        finally:
+            output_queue.put((name, None))
+
+    readers = [
+        threading.Thread(
+            target=read_stream,
+            args=("stdout", proc.stdout),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=read_stream,
+            args=("stderr", proc.stderr),
+            daemon=True,
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    while open_streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            name, chunk = output_queue.get(timeout=min(0.05, remaining))
+        except queue.Empty:
+            continue
+        if chunk is None:
+            open_streams.discard(name)
+            continue
+        chunks[name].append(chunk)
+        deadline = time.monotonic() + timeout
+
+    if not timed_out:
+        try:
+            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+
+    if timed_out:
+        _terminate_command_stt_process_tree(proc)
+        for reader in readers:
+            reader.join(timeout=0.5)
+        while True:
+            try:
+                name, chunk = output_queue.get_nowait()
+            except queue.Empty:
+                break
+            if chunk:
+                chunks[name].append(chunk)
+        stdout = "".join(chunks["stdout"])
+        stderr = "".join(chunks["stderr"])
+        try:
+            raise subprocess.TimeoutExpired(command, timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise subprocess.TimeoutExpired(
+                command,
+                timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
+
+    stdout = "".join(chunks["stdout"])
+    stderr = "".join(chunks["stderr"])
 
     if proc.returncode:
         raise subprocess.CalledProcessError(
@@ -802,7 +902,11 @@ def _transcribe_command_stt(
                 audio.name, provider_name,
             )
             try:
-                result = _run_command_stt(command, timeout)
+                result = _run_command_stt(
+                    command,
+                    timeout,
+                    env_passthrough=_command_stt_env_passthrough(config),
+                )
             except subprocess.TimeoutExpired:
                 return {
                     "success": False,
@@ -1390,6 +1494,117 @@ def _load_local_whisper_model(model_name: str, device: str = "auto", compute_typ
         return WhisperModel(model_name, device="cpu", compute_type="int8")
 
 
+# Silence-hallucination hardening defaults for local faster-whisper.
+# Whisper decodes SOMETHING even from pure silence/noise — often short junk
+# tokens ("You", "Thank you.", other-language phrases). Three layers kill the
+# class at the source (all tunable under ``stt.local``):
+#   1. vad_filter (Silero VAD, bundled with faster-whisper): silence never
+#      reaches the model. ``stt.local.vad: false`` restores raw behavior
+#      (e.g. transcribing music/ambient audio).
+#   2. condition_on_previous_text=False: one hallucinated token can't seed a
+#      run of them; negligible quality cost for voice-note-length audio.
+#   3. Segment confidence gate (see _is_hallucinated_segment): drops segments
+#      the model itself flags as probably-not-speech AND low-confidence.
+_VAD_MIN_SILENCE_MS_DEFAULT = 500
+_NO_SPEECH_PROB_THRESHOLD_DEFAULT = 0.6
+_LOGPROB_THRESHOLD_DEFAULT = -1.0
+
+
+def build_local_transcribe_kwargs(stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build the kwargs for EVERY local faster-whisper ``model.transcribe`` call.
+
+    Single owner for the anti-hallucination hardening — any new local-whisper
+    call site must go through this helper instead of hand-rolling kwargs.
+    """
+    stt_config = stt_config if isinstance(stt_config, dict) else _load_stt_config()
+    local_cfg = stt_config.get("local") or {}
+
+    kwargs: Dict[str, Any] = {
+        "beam_size": 5,
+        # Don't feed the previous window's text back as a prompt: a single
+        # hallucinated token otherwise seeds a self-reinforcing run of them.
+        "condition_on_previous_text": False,
+    }
+
+    vad_enabled = local_cfg.get("vad", True)
+    if vad_enabled is None:
+        vad_enabled = True
+    if bool(vad_enabled):
+        kwargs["vad_filter"] = True
+        try:
+            min_silence_ms = int(
+                local_cfg.get("vad_min_silence_ms", _VAD_MIN_SILENCE_MS_DEFAULT)
+            )
+        except (TypeError, ValueError):
+            min_silence_ms = _VAD_MIN_SILENCE_MS_DEFAULT
+        kwargs["vad_parameters"] = {"min_silence_duration_ms": min_silence_ms}
+    else:
+        kwargs["vad_filter"] = False
+
+    forced_lang = _resolve_stt_language("local", stt_config)
+    if forced_lang:
+        kwargs["language"] = forced_lang
+
+    initial_prompt = local_cfg.get("initial_prompt")
+    if isinstance(initial_prompt, str) and initial_prompt.strip():
+        kwargs["initial_prompt"] = initial_prompt
+
+    return kwargs
+
+
+def _confidence_thresholds(local_cfg: Dict[str, Any]) -> tuple[float, float]:
+    """Resolve (no_speech_prob, avg_logprob) gate thresholds from config."""
+    try:
+        no_speech = float(
+            local_cfg.get("no_speech_prob_threshold", _NO_SPEECH_PROB_THRESHOLD_DEFAULT)
+        )
+    except (TypeError, ValueError):
+        no_speech = _NO_SPEECH_PROB_THRESHOLD_DEFAULT
+    try:
+        logprob = float(local_cfg.get("logprob_threshold", _LOGPROB_THRESHOLD_DEFAULT))
+    except (TypeError, ValueError):
+        logprob = _LOGPROB_THRESHOLD_DEFAULT
+    return no_speech, logprob
+
+
+def _is_hallucinated_segment(segment: Any, no_speech_threshold: float, logprob_threshold: float) -> bool:
+    """True when a segment is very likely a silence hallucination.
+
+    Conservative AND gate (matches openai-whisper's own heuristic): the model
+    must BOTH think the window is non-speech (high no_speech_prob) AND have
+    decoded it with low confidence (low avg_logprob). Quiet-but-real speech
+    fails one of the two conditions and survives.
+    """
+    no_speech_prob = getattr(segment, "no_speech_prob", None)
+    avg_logprob = getattr(segment, "avg_logprob", None)
+    if no_speech_prob is None or avg_logprob is None:
+        return False
+    try:
+        no_speech_prob = float(no_speech_prob)
+        avg_logprob = float(avg_logprob)
+    except (TypeError, ValueError):
+        # Unknown segment shape (plugin/test doubles) — never drop.
+        return False
+    return no_speech_prob > no_speech_threshold and avg_logprob < logprob_threshold
+
+
+def _join_confident_segments(segments: Any, local_cfg: Dict[str, Any]) -> str:
+    """Join segment texts, dropping probable silence hallucinations."""
+    no_speech_threshold, logprob_threshold = _confidence_thresholds(local_cfg)
+    kept: list[str] = []
+    for segment in segments:
+        if _is_hallucinated_segment(segment, no_speech_threshold, logprob_threshold):
+            logger.debug(
+                "Dropping probable hallucinated segment %r (no_speech_prob=%.3f, avg_logprob=%.3f)",
+                getattr(segment, "text", ""),
+                getattr(segment, "no_speech_prob", float("nan")),
+                getattr(segment, "avg_logprob", float("nan")),
+            )
+            continue
+        kept.append(segment.text.strip())
+    return " ".join(kept).strip()
+
+
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
     global _local_model, _local_model_name
@@ -1419,20 +1634,16 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
                     )
                     _local_model_name = model_name
 
-        # Language: stt.local.language > stt.language > env var > auto-detect.
+        # Shared hardened kwargs: VAD filter (default on), no cross-window
+        # conditioning, language/initial_prompt resolution — one owner for
+        # every local faster-whisper call site.
         stt_config = _load_stt_config()
         local_config = stt_config.get("local") or {}
-        _forced_lang = _resolve_stt_language("local", stt_config)
-        transcribe_kwargs = {"beam_size": 5}
-        if _forced_lang:
-            transcribe_kwargs["language"] = _forced_lang
-        initial_prompt = local_config.get("initial_prompt")
-        if isinstance(initial_prompt, str) and initial_prompt.strip():
-            transcribe_kwargs["initial_prompt"] = initial_prompt
+        transcribe_kwargs = build_local_transcribe_kwargs(stt_config)
 
         try:
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+            transcript = _join_confident_segments(segments, local_config)
         except Exception as exc:
             # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
             # AFTER the model loaded successfully.  Evict the broken cached
@@ -1452,7 +1663,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
             _local_model_name = model_name
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+            transcript = _join_confident_segments(segments, local_config)
 
         logger.info(
             "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
@@ -1545,13 +1756,24 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
                 language=shlex.quote(language),
                 model=shlex.quote(normalized_model),
             )
-            # User-provided templates (env var) may contain shell syntax; auto-detected commands are safe for list mode.
-            use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
-            if use_shell:
-                subprocess.run(command, shell=True, check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            else:
-                subprocess.run(shlex.split(command), check=True, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
-            
+            # Scrub Hermes secrets from the child env (sibling path to #56332 /
+            # _run_command_stt — this local-whisper path previously inherited
+            # the full process environment).
+            from tools.environments.local import hermes_subprocess_env
+
+            child_env = hermes_subprocess_env(inherit_credentials=False)
+            subprocess.run(
+                shlex.split(command),
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+                env=child_env,
+                creationflags=windows_hide_flags(),
+            )
 
             txt_files = sorted(Path(output_dir).glob("*.txt"))
             if not txt_files:
@@ -1709,7 +1931,13 @@ def _transcribe_openai(
                     "response_format": "text" if model_name == "whisper-1" else "json",
                 }
                 if language:
-                    create_kwargs["language"] = language
+                    if model_name == "gpt-transcribe":
+                        # gpt-transcribe replaces the singular ``language``
+                        # field with a ``languages`` list; the API rejects
+                        # requests that send the legacy field.
+                        create_kwargs["extra_body"] = {"languages": [language]}
+                    else:
+                        create_kwargs["language"] = language
                     logger.debug("Using language hint '%s' for OpenAI STT", language)
                 return client.audio.transcriptions.create(**create_kwargs)
 
@@ -2129,6 +2357,15 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
           - "error" (str, optional): Error message if success is False
           - "provider" (str, optional): Which provider was used
     """
+    # Refuse to feed a credential / secret store (auth.json, .env, OAuth
+    # tokens, mcp-tokens/, ...) to an STT provider: an external provider would
+    # ship its plaintext contents to a third-party API. Mirrors the local-input
+    # read guard added to image-gen (587be5b5b) and xAI video-gen (104232979).
+    from agent.file_safety import get_read_block_error
+    blocked = get_read_block_error(file_path)
+    if blocked:
+        return {"success": False, "transcript": "", "error": blocked}
+
     # Apply common path validation before provider resolution so invalid files
     # cannot trigger provider setup or lazy installation. The remote-upload
     # size cap is enforced separately below, only for non-local providers.
@@ -2273,6 +2510,15 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
 
 def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
     """Safely validate, preprocess supported inputs, and dispatch transcription."""
+    # Refuse to feed a credential / secret store (auth.json, .env, OAuth
+    # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
+    # preprocessing, so the refusal names the real reason rather than a
+    # format error. Mirrors the image-gen / video-gen read guards.
+    from agent.file_safety import get_read_block_error
+    blocked = get_read_block_error(file_path)
+    if blocked:
+        return {"success": False, "transcript": "", "error": blocked}
+
     # Cap .silk sources before the decoder runs (decoder safety). For all
     # other inputs the remote-upload size cap is provider-scoped and enforced
     # in _transcribe_prepared_audio, so local whisper can handle big files.
