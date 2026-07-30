@@ -191,16 +191,45 @@ class TestSessionTokenInjection:
     """
 
     def test_honors_injected_token(self, monkeypatch):
-        import importlib
         import hermes_cli.web_server as ws
 
+        original_app = ws.app
+        original_token = ws._SESSION_TOKEN
         monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-seeded-token")
-        try:
-            importlib.reload(ws)
-            assert ws._SESSION_TOKEN == "desktop-seeded-token"
-        finally:
-            monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
-            importlib.reload(ws)
+        assert ws._resolve_session_token() == "desktop-seeded-token"
+        # No module reload: the loaded app and its adopted token are untouched.
+        assert ws.app is original_app
+        assert ws._SESSION_TOKEN == original_token
+
+    def test_falls_back_to_random_token(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        with patch.object(
+            ws.secrets, "token_urlsafe", return_value="generated-token"
+        ) as token_urlsafe:
+            assert ws._resolve_session_token() == "generated-token"
+        token_urlsafe.assert_called_once_with(32)
+
+    def test_session_token_resolution_preserves_loaded_app_auth(self, monkeypatch):
+        import hermes_cli.web_server as ws
+        from starlette.testclient import TestClient
+
+        original_app = ws.app
+        original_header_name = ws._SESSION_HEADER_NAME
+        original_token = ws._SESSION_TOKEN
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-seeded-token")
+        assert ws._resolve_session_token() == "desktop-seeded-token"
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        with patch.object(ws.secrets, "token_urlsafe", return_value="generated-token"):
+            assert ws._resolve_session_token() == "generated-token"
+
+        client = TestClient(original_app)
+        client.headers[original_header_name] = original_token
+        assert client.get("/api/__session_token_probe").status_code == 404
+        assert ws.app is original_app
+        assert ws._SESSION_HEADER_NAME == original_header_name
+        assert ws._SESSION_TOKEN == original_token
 
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1287,20 @@ class TestWebServerEndpoints:
 class TestBuildSchemaFromConfig:
 
 
+    def test_overrides_applied(self):
+        from hermes_cli.web_server import CONFIG_SCHEMA
+        # terminal.backend should be a select with options
+        if "terminal.backend" in CONFIG_SCHEMA:
+            entry = CONFIG_SCHEMA["terminal.backend"]
+            assert entry["type"] == "select"
+            assert "options" in entry
+            assert "local" in entry["options"]
+            assert "vercel_sandbox" in entry["options"]
+        runtime_entry = CONFIG_SCHEMA["terminal.vercel_runtime"]
+        assert runtime_entry["type"] == "select"
+        assert "node24" in runtime_entry["options"]
+        assert "python3.13" in runtime_entry["options"]
+        assert len(runtime_entry["options"]) >= 3
 
 
 

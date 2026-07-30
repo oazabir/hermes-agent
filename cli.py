@@ -77,14 +77,16 @@ except (ImportError, AttributeError):
 
 try:
     from hermes_cli.pt_input_extras import (
+        install_cmd_backspace_alias,
         install_ctrl_enter_alias,
         install_ignored_terminal_sequences,
         install_shift_enter_alias,
     )
     install_shift_enter_alias()
     install_ctrl_enter_alias()
+    install_cmd_backspace_alias()
     install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_ignored_terminal_sequences
+    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_ignored_terminal_sequences
 except Exception:
     pass
 import threading
@@ -664,12 +666,13 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -3234,10 +3237,12 @@ def _termux_example_image_path(filename: str = "cat.png") -> str:
         "/storage/emulated/0",
         "/storage/self/primary",
     ]
+    # Termux/Android roots are POSIX paths — join with literal forward
+    # slashes so the hint stays correct even when this renders on Windows.
     for root in candidates:
         if os.path.isdir(root):
-            return os.path.join(root, "Pictures", filename)
-    return os.path.join("~/storage/shared", "Pictures", filename)
+            return f"{root}/Pictures/{filename}"
+    return f"~/storage/shared/Pictures/{filename}"
 
 
 def _split_path_input(raw: str) -> tuple[str, str]:
@@ -3308,6 +3313,16 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
                 expanded = unquote(parsed.path or "")
                 if parsed.netloc and os.name == "nt":
                     expanded = f"//{parsed.netloc}{expanded}"
+                elif (
+                    os.name == "nt"
+                    and len(expanded) >= 3
+                    and expanded[0] == "/"
+                    and expanded[1].isalpha()
+                    and expanded[2] == ":"
+                ):
+                    # file:///C:/... parses to path "/C:/..." — drop the
+                    # leading slash so it resolves as a drive-letter path.
+                    expanded = expanded[1:]
         except Exception:
             expanded = token
     expanded = os.path.expandvars(os.path.expanduser(expanded))
@@ -4411,6 +4426,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif CLI_CONFIG["agent"].get("max_turns"):
             self.max_turns = CLI_CONFIG["agent"]["max_turns"]
         elif CLI_CONFIG.get("max_turns"):  # Backwards compat: root-level max_turns
+            # KEEP (evaluated for the v12 support-floor cleanup, July 2026):
+            # no versioned config migration ever rewrote root-level max_turns
+            # to agent.max_turns on disk — only load-time normalization
+            # (_normalize_max_turns_config) folds it, and configs read through
+            # other paths may bypass it. This fallback is therefore the only
+            # safety net for configs that still carry the root key.
             self.max_turns = CLI_CONFIG["max_turns"]
         elif os.getenv("HERMES_MAX_ITERATIONS"):
             try:
@@ -15570,6 +15591,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
+
+        @kb.add('escape', 'escape', filter=~_modal_prompt_active)
+        def handle_double_escape(event):
+            """Double ESC: discard the current draft and any attached images.
+
+            Matches Claude Code / Gemini CLI, where double-Esc is the
+            clear-the-composer gesture. It works while the agent is
+            streaming, which is the gap Ctrl+C leaves: Ctrl+C interrupts a
+            running turn and only clears the draft when idle, so mid-stream
+            there was no way to discard a half-typed prompt.
+
+            The draft is appended to history first, so Up recalls it — the
+            same undo affordance Claude Code provides, and the reason this
+            is safe to bind to a key pressed by reflex.
+
+            Single ESC is the prefix for Alt sequences (escape+enter,
+            escape+g, escape+v), so prompt_toolkit's escape-timeout keeps
+            those distinct from the double press. Modal prompts bind ESC
+            eagerly and are excluded here so cancel still wins.
+            """
+            buf = event.app.current_buffer
+            if not (buf.text or cli_ref._attached_images):
+                return
+            buf.reset(append_to_history=bool(buf.text))
+            cli_ref._attached_images.clear()
+            event.app.invalidate()
 
         @kb.add('c-z')
         def handle_ctrl_z(event):

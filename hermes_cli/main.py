@@ -794,6 +794,7 @@ from hermes_cli.model_setup_flows import (
     _model_flow_api_key_provider,
     _model_flow_anthropic,
     _model_flow_moa,
+    _model_flow_ai_gateway,
 )
 logger = logging.getLogger(__name__)
 
@@ -3370,6 +3371,8 @@ def select_provider_and_model(args=None):
         _model_flow_openrouter(config, current_model)
     elif selected_provider == "moa":
         _model_flow_moa(config, current_model)
+    elif selected_provider == "ai-gateway":
+        _model_flow_ai_gateway(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model, args=args)
     elif selected_provider == "openai-codex":
@@ -7537,6 +7540,22 @@ def _lazy_refresh_marker_path() -> Path:
     return PROJECT_ROOT / ".lazy-refresh-incomplete"
 
 
+def _pytest_owns_live_checkout(root: Path) -> bool:
+    """True when running under pytest AND ``root`` is this checkout itself.
+
+    Tests that drive update/recovery without sandboxing ``PROJECT_ROOT``
+    must neither litter the live repo root with recovery breadcrumbs
+    (a leftover ``.lazy-refresh-incomplete`` / ``.update-incomplete``
+    false-arms recovery on the developer's next real launch) nor run a real
+    reinstall against the executing venv. Sandboxed tests point at a
+    tmp_path and are unaffected (same posture as
+    ``managed_scope._under_pytest``)."""
+    return (
+        "PYTEST_CURRENT_TEST" in os.environ
+        and root == Path(__file__).resolve().parent.parent
+    )
+
+
 def _clear_marker_file(path: Path, *, label: str) -> None:
     """Remove an update-recovery breadcrumb. Never raises."""
     try:
@@ -7583,6 +7602,8 @@ def _recover_from_interrupted_install() -> None:
     protocol stream (``hermes acp`` speaks JSON-RPC on stdout) must never get
     install noise on stdout.
     """
+    if _pytest_owns_live_checkout(PROJECT_ROOT):
+        return
     core_marker = _update_marker_path().exists()
     lazy_marker = _lazy_refresh_marker_path().exists()
     if not core_marker and not lazy_marker:
@@ -8983,9 +9004,28 @@ def cmd_update(args):
     # writes to a closed stdout.  No-op in gateway mode.  See
     # _install_hangup_protection for rationale.
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
+    # Cross-process mutual exclusion. The dashboard's Update button spawns
+    # this same command detached, and the desktop hands off to the Tauri
+    # updater / install-mode bootstrap — all three mutate one checkout. Two of
+    # them running together rewrite source under a live interpreter and strand
+    # the tree half-updated. Share the marker the Tauri updater and Electron
+    # already use rather than inventing a second lock.
+    from hermes_cli.update_lock import (
+        UPDATE_EXIT_CONCURRENT,
+        UpdateLock,
+        describe_holder,
+    )
+
+    _update_lock = UpdateLock()
+    if not _update_lock.acquire():
+        print(describe_holder(_update_lock.holder))
+        _finalize_update_output(_update_io_state)
+        sys.exit(UPDATE_EXIT_CONCURRENT)
+
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)
     finally:
+        _update_lock.release()
         _finalize_update_output(_update_io_state)
 
 
