@@ -198,9 +198,24 @@ function setDismissed(paneId: string, dismissed: boolean) {
 const paneClosers: Record<string, () => void> = {}
 const paneOpeners: Record<string, () => void> = {}
 
-/** Route a pane's Close through the app store that owns its visibility. */
-export function registerPaneCloser(paneId: string, close: () => void) {
-  paneClosers[paneId] = close
+/** Pane ids whose Close an app store owns. True for the main workspace, whose
+ *  pane can't leave the tree but whose TAB can still be emptied — the close
+ *  GESTURE (⌘-click / middle-click) keys off this rather than `uncloseable`.
+ *  An atom, not a lookup: a closer registered by a wiring EFFECT lands after
+ *  the strip's first paint, and a plain read would leave that tab gestureless
+ *  until something else happened to re-render it. */
+export const $panesWithCloser = atom<ReadonlySet<string>>(new Set())
+
+/** Route a pane's Close through the app store that owns its visibility.
+ *  Passing no closer unregisters (a wiring effect's cleanup). */
+export function registerPaneCloser(paneId: string, close?: () => void) {
+  if (close) {
+    paneClosers[paneId] = close
+  } else {
+    delete paneClosers[paneId]
+  }
+
+  $panesWithCloser.set(new Set(Object.keys(paneClosers)))
 }
 
 /**
@@ -385,6 +400,36 @@ export function closeFocusedSessionTab(): boolean {
   return true
 }
 
+/** ⌘W / zone-menu Close over a TOOL PANEL (terminal / logs): take the tab OUT
+ *  of the strip like any other tab, and sync the owning store so its toggle
+ *  (⌃` / the ⌘K row) stays truthful and can bring the pane back.
+ *
+ *  A tool panel's closer is its visibility STORE, so routing Close through
+ *  `closeTreePane` only collapsed the zone to a rail — the tab stayed put and
+ *  Close read as a no-op. Dismiss first so the store listener's collapse lands
+ *  on an absent pane instead of minimizing a shared zone's surviving sibling. */
+export function closeToolPane(paneId: string) {
+  dismissTreePane(paneId)
+  paneClosers[paneId]?.()
+}
+
+/** ⌘W over a TOOL PANEL zone (terminal / logs): close its active tab, the same
+ *  as any other tab. These zones host no chat strip, so `focusedSessionGroup`
+ *  skips them — without this rung ⌘W was a dead key over the terminal and the
+ *  logs pane, the only tabs in the app you couldn't close from the keyboard. */
+export function closeFocusedToolTab(): boolean {
+  const group = tabTargetGroup(g => g.panes.some(isCollapsePane))
+  const active = group?.active
+
+  if (!active || !isCollapsePane(active)) {
+    return false
+  }
+
+  closeToolPane(active)
+
+  return true
+}
+
 /** Closeable siblings of `paneId` within its group, split by position — powers
  *  the tab menu's Close-others / Close-to-the-right verbs (and their enablement). */
 function closeableTreeSiblings(paneId: string): { others: string[]; right: string[] } {
@@ -405,12 +450,22 @@ export function treeTabCloseTargets(paneId: string): { all: number; others: numb
   return { all: others.length + (isUncloseablePane(paneId) ? 0 : 1), others: others.length, right: right.length }
 }
 
+/** Close a tab the way its kind expects: a tool panel leaves the strip (and
+ *  syncs its toggle), everything else routes through its owning Close. */
+export function closeTabPane(paneId: string) {
+  if (isCollapsePane(paneId)) {
+    closeToolPane(paneId)
+  } else {
+    closeTreePane(paneId)
+  }
+}
+
 export function closeOtherTreeTabs(paneId: string): void {
-  closeableTreeSiblings(paneId).others.forEach(closeTreePane)
+  closeableTreeSiblings(paneId).others.forEach(closeTabPane)
 }
 
 export function closeTreeTabsToRight(paneId: string): void {
-  closeableTreeSiblings(paneId).right.forEach(closeTreePane)
+  closeableTreeSiblings(paneId).right.forEach(closeTabPane)
 }
 
 /** Close every closeable tab in `paneId`'s group (the uncloseable workspace stays). */
@@ -418,7 +473,7 @@ export function closeAllTreeTabs(paneId: string): void {
   const tree = $layoutTree.get()
   const panes = (tree ? findGroupOfPane(tree, paneId) : null)?.panes ?? []
 
-  panes.filter(id => !isUncloseablePane(id)).forEach(closeTreePane)
+  panes.filter(id => !isUncloseablePane(id)).forEach(closeTabPane)
 }
 
 /** Pane ids in the tree under a `${prefix}:` namespace — lets a mirror prune
@@ -569,8 +624,7 @@ function rootRow(): SplitNode | null {
 
   return (
     (tree.children.find(child => child.type === 'split' && child.orientation === 'row' && hasMain(child)) as
-      | SplitNode
-      | undefined) ?? null
+      SplitNode | undefined) ?? null
   )
 }
 
