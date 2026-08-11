@@ -321,9 +321,10 @@ class MattermostAdapter(BasePlatformAdapter):
             logger.error("Mattermost: URL or token not configured")
             return False
 
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        )
+        # No session-level timeout: each _api_* method uses asyncio.wait_for()
+        # to avoid "Timeout context manager should be used inside a task" errors
+        # when invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
+        self._session = aiohttp.ClientSession()
         self._closing = False
 
         # Verify credentials and fetch bot identity.
@@ -912,12 +913,19 @@ class MattermostAdapter(BasePlatformAdapter):
                     f"@{self._bot_user_id}",
                 ]
                 # Check if the reply mentions someone other than the bot.
+                # If the bot IS mentioned alongside others, process it (the
+                # user is talking to the bot and mentioning someone else).
+                # Only ignore when the reply mentions others but NOT the bot.
                 all_mentions = re.findall(r"@\S+", message_text)
+                bot_mentioned = any(
+                    m.lower() in {p.lower() for p in mention_patterns}
+                    for m in all_mentions
+                )
                 non_bot_mentions = [
                     m for m in all_mentions
                     if m.lower() not in {p.lower() for p in mention_patterns}
                 ]
-                if non_bot_mentions:
+                if non_bot_mentions and not bot_mentioned:
                     logger.debug(
                         "Mattermost: ignoring thread reply directed at others (root=%s, channel=%s, mentions=%s)",
                         thread_root, channel_id, non_bot_mentions,
@@ -1004,17 +1012,23 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Determine message type.
         # Mattermost intercepts /-prefixed messages client-side as slash
-        # commands — they never reach the bot via WebSocket.  Use a
-        # backslash prefix (\command) instead so users can explicitly
-        # invoke gateway commands without them being intercepted.
-        # Both / and \ are accepted as command prefixes.
+        # commands — they never reach the bot via WebSocket.  It also strips
+        # backslash before non-special chars (\reset → reset) as part of
+        # Markdown escape processing, so \-prefixed commands arrive
+        # mangled.  Use ! as the gateway command prefix instead.
+        # A / fallback is kept for cases where the slash does reach the
+        # bot (e.g. webhook integrations).
         file_ids = post.get("file_ids") or []
         msg_type = MessageType.TEXT
-        if message_text.startswith("\\"):
+        # Strip leading whitespace before command detection — Mattermost
+        # mobile sometimes sends commands with a leading space.
+        if message_text[:1].isspace() and message_text.lstrip().startswith(("!", "/")):
+            message_text = message_text.lstrip()
+        if message_text.startswith("!"):
             message_text = "/" + message_text[1:]
             msg_type = MessageType.COMMAND
             logger.debug(
-                "Mattermost: backslash command detected, converted '%s' → '%s'",
+                "Mattermost: exclamation command detected, converted '%s' → '%s'",
                 post.get("message", ""), message_text,
             )
         elif message_text.startswith("/"):

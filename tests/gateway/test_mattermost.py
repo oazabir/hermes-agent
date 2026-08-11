@@ -347,6 +347,86 @@ class TestMattermostWebSocketParsing:
         assert msg_event.message_type is MessageType.COMMAND
         assert msg_event.get_command() == "new"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command_name",
+        ["reset", "stop", "new", "help", "model", "usage", "compress", "skills"],
+    )
+    async def test_exclamation_prefix_any_command(self, command_name):
+        """Any !-prefixed message should be treated as a gateway command."""
+        post_data = {
+            "id": f"post_excl_{command_name}",
+            "user_id": "user_123",
+            "channel_id": "chan_dm",
+            "message": f"!{command_name}",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@bob",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.text == f"/{command_name}"
+        assert msg_event.message_type is MessageType.COMMAND
+        assert msg_event.get_command() == command_name
+
+    @pytest.mark.asyncio
+    async def test_exclamation_prefix_with_args(self):
+        """!model openai/gpt-4 should pass args through correctly."""
+        post_data = {
+            "id": "post_excl_args",
+            "user_id": "user_123",
+            "channel_id": "chan_dm",
+            "message": "!model openai/gpt-4",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@bob",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/model openai/gpt-4"
+        assert msg_event.message_type is MessageType.COMMAND
+        assert msg_event.get_command() == "model"
+        assert msg_event.get_command_args() == "openai/gpt-4"
+
+    @pytest.mark.asyncio
+    async def test_exclamation_prefix_leading_space(self):
+        """Leading-space !commands should be handled (mobile quirk)."""
+        post_data = {
+            "id": "post_excl_space",
+            "user_id": "user_123",
+            "channel_id": "chan_dm",
+            "message": " !new",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@bob",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/new"
+        assert msg_event.message_type is MessageType.COMMAND
+        assert msg_event.get_command() == "new"
+
 
 # ---------------------------------------------------------------------------
 # Mention behavior (require_mention + free_response_channels)
