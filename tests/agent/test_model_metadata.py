@@ -482,11 +482,86 @@ class TestCodexOAuthContextLength:
 
         assert ctx == live_context
         mock_get.assert_called_once()
-        remaining = _yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
+        remaining = _yaml.safe_load(cache_file.read_text(encoding="utf-8")).get(
+            "context_lengths", {}
+        )
         assert remaining.get(stale_key) == live_context
         assert remaining.get(other_key) == 128_000
 
 
+
+
+# =========================================================================
+# Custom endpoint model metadata
+# =========================================================================
+
+class TestFetchEndpointModelMetadata:
+    def setup_method(self):
+        import agent.model_metadata as mm
+        mm._endpoint_model_metadata_cache.clear()
+        mm._endpoint_model_metadata_cache_time.clear()
+
+    @pytest.mark.parametrize("status_code", [401, 403])
+    def test_auth_failure_stops_after_first_candidate(self, status_code):
+        import agent.model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = status_code
+        response.raise_for_status.side_effect = RuntimeError(str(status_code))
+
+        with patch("agent.model_metadata.requests.get", return_value=response) as mock_get:
+            result = mm.fetch_endpoint_model_metadata("https://custom.example/v1")
+
+        assert result == {}
+        mock_get.assert_called_once()
+        assert mock_get.call_args.kwargs["stream"] is True
+        response.raise_for_status.assert_not_called()
+        response.json.assert_not_called()
+        response.close.assert_called_once()
+
+    def test_auth_failure_empty_result_is_cached(self):
+        import agent.model_metadata as mm
+
+        response = MagicMock()
+        response.status_code = 401
+        response.raise_for_status.side_effect = RuntimeError("401")
+
+        with patch("agent.model_metadata.requests.get", return_value=response) as mock_get:
+            first = mm.fetch_endpoint_model_metadata("https://custom.example/v1")
+            second = mm.fetch_endpoint_model_metadata("https://custom.example/v1")
+
+        assert first == second == {}
+        mock_get.assert_called_once()
+        response.close.assert_called_once()
+
+    def test_not_found_still_tries_alternate_candidate(self):
+        import agent.model_metadata as mm
+
+        not_found = MagicMock()
+        not_found.status_code = 404
+        not_found.raise_for_status.side_effect = RuntimeError("404")
+        success = MagicMock()
+        success.status_code = 200
+        success.json.return_value = {
+            "data": [{"id": "test/model", "context_length": 32768}]
+        }
+
+        with patch(
+            "agent.model_metadata.requests.get",
+            side_effect=[not_found, success],
+        ) as mock_get:
+            result = mm.fetch_endpoint_model_metadata("https://custom.example/v1")
+
+        assert result["test/model"]["context_length"] == 32768
+        assert mock_get.call_count == 2
+        assert [call.args[0] for call in mock_get.call_args_list] == [
+            "https://custom.example/v1/models",
+            "https://custom.example/models",
+        ]
+        assert all(call.kwargs["stream"] is True for call in mock_get.call_args_list)
+        not_found.json.assert_not_called()
+        not_found.close.assert_called_once()
+        success.close.assert_called_once()
 
 
 # =========================================================================
@@ -544,7 +619,7 @@ class TestNousPortalContextResolution:
         )
         assert ctx == 1_000_000, "OR fallback should still serve the request"
         assert not cache_file.exists() or not yaml.safe_load(
-            cache_file.read_text()
+            cache_file.read_text(encoding="utf-8")
         ).get("context_lengths", {}), (
             "OR-fallback values must NOT be persisted — a single portal blip "
             "would otherwise freeze the wrong value in via step-1 cache hit"
@@ -586,7 +661,9 @@ class TestNousPortalContextResolution:
             f"Stale OR-derived cache entry should not have leaked through; got {ctx}"
         )
 
-        remaining = yaml.safe_load(cache_file.read_text()).get("context_lengths", {})
+        remaining = yaml.safe_load(cache_file.read_text(encoding="utf-8")).get(
+            "context_lengths", {}
+        )
         assert remaining.get(stale_key) == 262_144, (
             "Portal value should have overwritten the stale entry on disk"
         )
@@ -821,6 +898,33 @@ class TestStripProviderPrefix:
         assert _strip_provider_prefix("http://example.com") == "http://example.com"
         assert _strip_provider_prefix("https://example.com") == "https://example.com"
 
+    def test_registered_profile_name_and_alias_are_stripped(self, monkeypatch):
+        import providers
+        from providers import ProviderProfile
+
+        monkeypatch.setattr(providers, "_REGISTRY", {})
+        monkeypatch.setattr(providers, "_ALIASES", {})
+        monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
+        monkeypatch.setattr(providers, "_discovered", True)
+        providers.register_provider(
+            ProviderProfile(name="fake-provider", aliases=("fake-alias",))
+        )
+
+        assert _strip_provider_prefix("fake-provider:org/model") == "org/model"
+        assert _strip_provider_prefix("fake-alias:org/model") == "org/model"
+
+    def test_bundled_plugin_provider_prefix_is_stripped(self):
+        assert _strip_provider_prefix("fireworks:accounts/fireworks/models/foo") == (
+            "accounts/fireworks/models/foo"
+        )
+
+    def test_unknown_provider_prefix_is_unchanged(self):
+        assert _strip_provider_prefix("not-a-provider:org/model") == (
+            "not-a-provider:org/model"
+        )
+
+    def test_ollama_model_tag_is_unchanged(self):
+        assert _strip_provider_prefix("qwen3.5:27b") == "qwen3.5:27b"
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_ollama_model_tag_not_mangled_in_context_lookup(self, mock_fetch):
@@ -1017,7 +1121,7 @@ class TestContextLengthCache:
         """``context_lengths:`` with no value parses as None — must behave
         like an empty cache instead of crashing every caller (#47135)."""
         cache_file = tmp_path / "cache.yaml"
-        cache_file.write_text("context_lengths:\n")
+        cache_file.write_text("context_lengths:\n", encoding="utf-8")
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             assert get_cached_context_length("test/model", "http://x") is None
             # save must also survive the null key and repair the file
@@ -1031,7 +1135,7 @@ class TestContextLengthCache:
         with patch("agent.model_metadata._get_context_cache_path", return_value=cache_file):
             save_context_length("model", "http://x", 32768)
             save_context_length("model", "http://x", 32768)
-            with open(cache_file) as f:
+            with open(cache_file, encoding="utf-8") as f:
                 data = yaml.safe_load(f)
             assert len(data["context_lengths"]) == 1
 
@@ -1119,7 +1223,7 @@ class TestMoAContextLength:
             payload["custom_providers"] = custom_providers
         if providers is not None:
             payload["providers"] = providers
-        with open(os.path.join(home, "config.yaml"), "w") as f:
+        with open(os.path.join(home, "config.yaml"), "w", encoding="utf-8") as f:
             yaml.safe_dump(payload, f)
 
     def test_moa_resolves_from_aggregator(self, tmp_path, monkeypatch):

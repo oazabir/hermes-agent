@@ -269,6 +269,10 @@ export const ja = defineLocale({
         credits: {
           label: 'クレジット通知',
           description: 'クレジットの利用が停止または復旧しました。'
+        },
+        plugin: {
+          label: 'プラグイン通知',
+          description: 'Hermes がバックグラウンドの間に、デスクトッププラグインが通知を送信しました。'
         }
       },
       test: 'テスト通知を送信',
@@ -1396,6 +1400,12 @@ export const ja = defineLocale({
     search: 'プロファイルを検索...',
     loading: 'プロファイルを読み込み中...',
     newProfile: '新しいプロファイル',
+    importProfile: 'プロファイルをインポート…',
+    exportProfile: 'プロファイルをエクスポート…',
+    imported: 'プロファイルをインポートしました',
+    exported: 'プロファイルをエクスポートしました',
+    failedImport: 'プロファイルのインポートに失敗しました',
+    failedExport: 'プロファイルのエクスポートに失敗しました',
     allProfiles: 'すべてのプロファイル',
     showAllProfiles: 'すべてのプロファイルを表示',
     switchToProfile: name => `${name} に切り替え`,
@@ -1686,6 +1696,7 @@ export const ja = defineLocale({
     noWorkspace: 'ワークスペースなし',
     projectEmpty: 'セッションはまだありません',
     noSessions: 'セッションはまだありません',
+    noFilterMatches: 'このフィルターに一致するセッションはありません',
     projects: {
       sectionLabel: 'プロジェクト',
       home: 'ホーム',
@@ -1729,6 +1740,9 @@ export const ja = defineLocale({
       baseBranchPlaceholder: 'ブランチを検索…',
       baseBranchNone: 'ブランチが見つかりません',
       startWorkFailed: 'ワークツリーを作成できませんでした',
+      worktreeProjectLabel: 'プロジェクト',
+      worktreeProjectPlaceholder: 'プロジェクトを検索…',
+      worktreeProjectNone: 'フォルダのあるプロジェクトがありません',
       convertBranch: 'ブランチを変換…',
       convertBranchTitle: 'ブランチを変換',
       convertBranchDesc: 'チェックアウト済みのブランチを開くか、空いているブランチのワークツリーを作成します。',
@@ -1737,6 +1751,7 @@ export const ja = defineLocale({
       branchOpenExisting: '開く',
       branchSwitchHome: 'ホームを切替',
       branchCreateWorktree: '新しいワークツリー',
+      branchTrackRemote: 'リモートを追跡',
       branchesLoading: 'ブランチを読み込み中…',
       noBranches: 'ブランチが見つかりません',
       removeWorktree: 'ワークツリーを削除',
@@ -1770,6 +1785,7 @@ export const ja = defineLocale({
       waitingForAnswer: '回答を待っています',
       finishedUnread: '完了 — 未読',
       backgroundRunning: 'バックグラウンドタスク実行中',
+      draftSession: '下書き — 未送信',
       handoffOrigin: platform => `${platform} から引き継ぎ`,
       ownedByProfile: profile => `プロファイル: ${profile}`,
       renamed: '名前を変更しました',
@@ -1789,6 +1805,10 @@ export const ja = defineLocale({
       thisWeek: '今週',
       lastWeek: '先週',
       thisMonth: '今月'
+    },
+    statusDivider: {
+      working: '実行中',
+      done: '完了'
     }
   },
 
@@ -1817,6 +1837,7 @@ export const ja = defineLocale({
       '調整または続行'
     ],
     startVoice: '音声会話を開始',
+    openDirective: '開く',
     queueMessage: 'メッセージをキューに入れる',
     stop: '停止',
     send: '送信',
@@ -2390,10 +2411,6 @@ export const ja = defineLocale({
 
   preview: {
     tab: 'プレビュー',
-    closeTab: label => `${label} を閉じる`,
-    closeOthers: '他を閉じる',
-    closeToRight: '右側を閉じる',
-    closeAll: 'すべて閉じる',
     closePane: 'プレビューペインを閉じる',
     loading: 'プレビューを読み込み中',
     unavailable: 'プレビューは利用できません',
@@ -2488,6 +2505,7 @@ export const ja = defineLocale({
     hideHeader: 'ヘッダーを隠す',
     minimize: '最小化',
     restore: '復元',
+    reload: '再読み込み',
     closeOthers: '他を閉じる',
     closeToRight: '右側を閉じる',
     closeAll: 'すべて閉じる',
@@ -2517,7 +2535,8 @@ export const ja = defineLocale({
     layoutNamePlaceholder: fallback => `レイアウト名（${fallback}）`,
     saveApply: '保存して適用',
     notExpressible: 'この配置は互いに噛み合っています（風車型）— 入れ子の分割では表現できません',
-    zoneCount: count => `${count} ゾーン`
+    zoneCount: count => `${count} ゾーン`,
+    tabCount: count => `${count} 個のタブ`
   },
 
   assistant: {

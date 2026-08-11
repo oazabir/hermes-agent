@@ -263,6 +263,10 @@ export const zhHant = defineLocale({
         credits: {
           label: '額度提醒',
           description: '額度存取被暫停或恢復。'
+        },
+        plugin: {
+          label: '外掛通知',
+          description: 'Hermes 在背景時，桌面外掛傳送了通知。'
         }
       },
       test: '傳送測試通知',
@@ -1345,6 +1349,12 @@ export const zhHant = defineLocale({
     search: '搜尋設定檔…',
     loading: '正在載入設定檔…',
     newProfile: '新增設定檔',
+    importProfile: '匯入設定檔…',
+    exportProfile: '匯出設定檔…',
+    imported: '設定檔已匯入',
+    exported: '設定檔已匯出',
+    failedImport: '匯入設定檔失敗',
+    failedExport: '匯出設定檔失敗',
     allProfiles: '全部設定檔',
     showAllProfiles: '顯示全部設定檔',
     switchToProfile: name => `切換至 ${name}`,
@@ -1631,6 +1641,7 @@ export const zhHant = defineLocale({
     noWorkspace: '無工作區',
     projectEmpty: '尚無工作階段',
     noSessions: '尚無工作階段',
+    noFilterMatches: '沒有工作階段符合這些篩選條件',
     projects: {
       sectionLabel: '專案',
       home: '主頁',
@@ -1672,6 +1683,9 @@ export const zhHant = defineLocale({
       baseBranchPlaceholder: '搜尋分支…',
       baseBranchNone: '未找到分支',
       startWorkFailed: '無法建立工作樹',
+      worktreeProjectLabel: '專案',
+      worktreeProjectPlaceholder: '搜尋專案…',
+      worktreeProjectNone: '沒有包含資料夾的專案',
       convertBranch: '轉換分支…',
       convertBranchTitle: '轉換分支',
       convertBranchDesc: '開啟已簽出的分支，或為可用分支建立工作樹。',
@@ -1680,6 +1694,7 @@ export const zhHant = defineLocale({
       branchOpenExisting: '開啟',
       branchSwitchHome: '切回主簽出',
       branchCreateWorktree: '新增工作樹',
+      branchTrackRemote: '追蹤遠端',
       branchesLoading: '正在載入分支…',
       noBranches: '找不到分支',
       removeWorktree: '移除工作樹',
@@ -1712,6 +1727,7 @@ export const zhHant = defineLocale({
       waitingForAnswer: '等待您的回答',
       finishedUnread: '已完成 — 未讀',
       backgroundRunning: '背景任務執行中',
+      draftSession: '草稿 — 尚未傳送',
       handoffOrigin: platform => `從 ${platform} 轉接`,
       ownedByProfile: profile => `設定檔：${profile}`,
       renamed: '已重新命名',
@@ -1731,6 +1747,10 @@ export const zhHant = defineLocale({
       thisWeek: '本週',
       lastWeek: '上週',
       thisMonth: '本月'
+    },
+    statusDivider: {
+      working: '進行中',
+      done: '已完成'
     }
   },
 
@@ -1759,6 +1779,7 @@ export const zhHant = defineLocale({
       '調整或繼續'
     ],
     startVoice: '開始語音對話',
+    openDirective: '開啟',
     queueMessage: '排隊訊息',
     stop: '停止',
     send: '傳送',
@@ -2313,10 +2334,6 @@ export const zhHant = defineLocale({
 
   preview: {
     tab: '預覽',
-    closeTab: label => `關閉 ${label}`,
-    closeOthers: '關閉其他',
-    closeToRight: '關閉右側',
-    closeAll: '全部關閉',
     closePane: '關閉預覽窗格',
     loading: '正在載入預覽',
     unavailable: '預覽不可用',
@@ -2408,6 +2425,7 @@ export const zhHant = defineLocale({
     hideHeader: '隱藏標題列',
     minimize: '最小化',
     restore: '還原',
+    reload: '重新載入',
     closeOthers: '關閉其他',
     closeToRight: '關閉右側',
     closeAll: '全部關閉',
@@ -2437,7 +2455,8 @@ export const zhHant = defineLocale({
     layoutNamePlaceholder: fallback => `版面名稱（${fallback}）`,
     saveApply: '儲存並套用',
     notExpressible: '此排列互相咬合（風車形）——暫時無法表示為巢狀分割',
-    zoneCount: count => `${count} 個區域`
+    zoneCount: count => `${count} 個區域`,
+    tabCount: count => `${count} 個分頁`
   },
 
   assistant: {
