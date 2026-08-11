@@ -942,46 +942,54 @@ class MattermostAdapter(BasePlatformAdapter):
                 # ── Command detection (BEFORE thread context injection) ──
                 # Detect ! and / commands on the raw stripped text. Thread
                 # context injection below prepends "[Original message...]"
-                # which would break startswith() checks.
+                # which would break startswith() checks.  Commands skip
+                # context injection entirely — they don't need thread root
+                # context and the prefix would break is_command().
+                _is_command_in_thread = False
                 if message_text[:1].isspace() and message_text.lstrip().startswith(("!", "/")):
                     message_text = message_text.lstrip()
                 if message_text.startswith("!"):
                     message_text = "/" + message_text[1:]
                     msg_type = MessageType.COMMAND
+                    _is_command_in_thread = True
                     logger.debug(
                         "Mattermost: exclamation command in thread detected, converted '%s' → '%s'",
                         post.get("message", ""), message_text,
                     )
                 elif message_text.startswith("/"):
                     msg_type = MessageType.COMMAND
+                    _is_command_in_thread = True
 
                 # Fetch the original message that started this thread so the
                 # agent has full context of what was asked.
-                root_post = await self._api_get(f"posts/{thread_root}")
-                if root_post:
-                    root_message = root_post.get("message", "")
-                    root_sender = root_post.get("user_id", "")
-                    if root_sender == self._bot_user_id:
-                        # The thread root is the bot's own reply. Fetch the
-                        # user's message that the bot replied to.
-                        parent_id = root_post.get("root_id")
-                        if parent_id:
-                            parent_post = await self._api_get(f"posts/{parent_id}")
-                            if parent_post:
-                                parent_msg = parent_post.get("message", "")
-                                if parent_msg:
-                                    message_text = (
-                                        f"[Original message that started this thread: "
-                                        f"{parent_msg}]\n\n{message_text}"
-                                    )
-                    else:
-                        # The thread root is the user's original mention.
-                        # Inject it as context for the agent.
-                        if root_message:
-                            message_text = (
-                                f"[Original message that started this thread: "
-                                f"{root_message}]\n\n{message_text}"
-                            )
+                # Skip context injection for commands — the prefix would
+                # break is_command() and commands don't need root context.
+                if not _is_command_in_thread:
+                    root_post = await self._api_get(f"posts/{thread_root}")
+                    if root_post:
+                        root_message = root_post.get("message", "")
+                        root_sender = root_post.get("user_id", "")
+                        if root_sender == self._bot_user_id:
+                            # The thread root is the bot's own reply. Fetch the
+                            # user's message that the bot replied to.
+                            parent_id = root_post.get("root_id")
+                            if parent_id:
+                                parent_post = await self._api_get(f"posts/{parent_id}")
+                                if parent_post:
+                                    parent_msg = parent_post.get("message", "")
+                                    if parent_msg:
+                                        message_text = (
+                                            f"[Original message that started this thread: "
+                                            f"{parent_msg}]\n\n{message_text}"
+                                        )
+                        else:
+                            # The thread root is the user's original mention.
+                            # Inject it as context for the agent.
+                            if root_message:
+                                message_text = (
+                                    f"[Original message that started this thread: "
+                                    f"{root_message}]\n\n{message_text}"
+                                )
             else:
                 require_mention = os.getenv(
                     "MATTERMOST_REQUIRE_MENTION", "true"
