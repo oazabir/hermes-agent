@@ -324,7 +324,9 @@ class MattermostAdapter(BasePlatformAdapter):
         # No session-level timeout: each _api_* method uses asyncio.wait_for()
         # to avoid "Timeout context manager should be used inside a task" errors
         # when invoked via asyncio.run_coroutine_threadsafe() from cron jobs.
-        self._session = aiohttp.ClientSession()
+        self._session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False),
+        )
         self._closing = False
 
         # Verify credentials and fetch bot identity.
@@ -936,6 +938,23 @@ class MattermostAdapter(BasePlatformAdapter):
                     message_text = re.sub(
                         re.escape(pattern), "", message_text, flags=re.IGNORECASE
                     ).strip()
+
+                # ── Command detection (BEFORE thread context injection) ──
+                # Detect ! and / commands on the raw stripped text. Thread
+                # context injection below prepends "[Original message...]"
+                # which would break startswith() checks.
+                if message_text[:1].isspace() and message_text.lstrip().startswith(("!", "/")):
+                    message_text = message_text.lstrip()
+                if message_text.startswith("!"):
+                    message_text = "/" + message_text[1:]
+                    msg_type = MessageType.COMMAND
+                    logger.debug(
+                        "Mattermost: exclamation command in thread detected, converted '%s' → '%s'",
+                        post.get("message", ""), message_text,
+                    )
+                elif message_text.startswith("/"):
+                    msg_type = MessageType.COMMAND
+
                 # Fetch the original message that started this thread so the
                 # agent has full context of what was asked.
                 root_post = await self._api_get(f"posts/{thread_root}")
