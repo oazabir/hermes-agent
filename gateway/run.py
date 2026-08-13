@@ -43,7 +43,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
@@ -2262,6 +2262,12 @@ if _config_path.exists():
                 os.environ["HERMES_SESSION_STALL_TIMEOUT"] = str(
                     _agent_cfg["session_stall_timeout"]
                 )
+            if "reconnect_attention_after" in _agent_cfg:
+                # Internal bridge only — config.yaml (agent.reconnect_attention_after)
+                # is the documented, user-facing setting.
+                os.environ["HERMES_RECONNECT_ATTENTION_AFTER_SECONDS"] = str(
+                    _agent_cfg["reconnect_attention_after"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -3788,10 +3794,41 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
 
+# Seconds a platform may sit continuously in the reconnect queue before the
+# watcher flags it NEEDS_ATTENTION in runtime status. Retrying never stops
+# (auto-pause was deliberately removed — a transient outage must self-heal
+# without operator action); this only makes a *long-lived* retry loop loud so
+# owners and fleet monitoring can distinguish hour one from week three.
+# A dead bot token, a revoked Discord intent, or a deterministically crashing
+# sidecar all present as "retrying" forever without this signal.
+# User-facing setting: agent.reconnect_attention_after in config.yaml
+# (bridged to this env var above). 0 disables.
+_RECONNECT_ATTENTION_AFTER_SECONDS = _float_env(
+    "HERMES_RECONNECT_ATTENTION_AFTER_SECONDS", 7200
+)
+
 
 def _reconnect_backoff(attempt: int) -> int:
     """Exponential reconnect backoff: 30s, 60s, 120s, ... capped at 5 min."""
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
+
+
+def _reconnect_needs_attention(info: dict, now: float) -> bool:
+    """Return True when a reconnect-queue entry has been continuously queued
+    long enough to warrant a NEEDS_ATTENTION signal.
+
+    ``queued_at`` is (re)stamped whenever the platform (re)enters the queue,
+    so a platform that reconnects successfully and later fails again starts a
+    fresh clock — only *continuous* failure escalates. Entries queued before
+    this field existed (in-flight upgrade) are treated as newly queued.
+    """
+    if _RECONNECT_ATTENTION_AFTER_SECONDS <= 0:
+        return False  # escalation disabled
+    queued_at = info.get("queued_at")
+    if queued_at is None:
+        info["queued_at"] = now
+        return False
+    return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
 class TurnRunner:
@@ -3893,6 +3930,16 @@ class TurnRunner:
             msg = f"💬 {thinking_text}" if thinking_text else None
             if msg:
                 ctx.progress_queue.put(msg)
+            return
+
+        # Native task cards consume the authoritative ID-bearing
+        # tool_start/tool_complete callbacks instead. Do not also enqueue
+        # name-correlated text events, which would duplicate cards and
+        # mispair concurrent calls to the same tool.
+        if ctx._native_slack_task_cards and event_type in {
+            "tool.started",
+            "tool.completed",
+        }:
             return
 
         # If tool_progress is off, only _thinking passes through (above).
@@ -4071,6 +4118,188 @@ class TurnRunner:
 
         ctx.progress_queue.put(msg)
 
+    async def _send_native_task_card_progress(self, adapter) -> None:
+        """Drain the progress queue into Slack-native plan/task cards (#29483).
+
+        Consumes the ID-bearing lifecycle dicts queued by
+        native_tool_start_callback / native_tool_complete_callback and renders
+        them through the adapter's chat.startStream plan/task-card stream.
+        On any native failure, falls back to an editable in-thread text
+        message so progress stays live for the rest of the turn.
+        """
+        ctx = self._ctx
+        tasks: Dict[str, Dict[str, str]] = {}
+        task_order: List[str] = []
+        fallback_msg_id: Optional[str] = None
+        native_failed = False
+        anonymous_seq = 0
+
+        def _compact(value: Any, limit: int = 120) -> str:
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            if len(text) <= limit:
+                return text
+            return text[: limit - 3].rstrip() + "..."
+
+        def _visible_tasks() -> List[Dict[str, str]]:
+            return [tasks[task_id] for task_id in task_order[-8:]]
+
+        def _fallback_text() -> str:
+            labels = {
+                "in_progress": "running",
+                "complete": "complete",
+                "error": "error",
+            }
+            lines = [
+                f"- {task['title']} - {labels.get(task['status'], task['status'])}"
+                for task in _visible_tasks()
+            ]
+            return "Hermes is working\n" + "\n".join(lines)
+
+        def _apply_native_event(raw: Any) -> bool:
+            nonlocal anonymous_seq
+            if not isinstance(raw, dict):
+                return False
+            event_type = raw.get("type")
+            if event_type not in {"tool.started", "tool.completed"}:
+                return False
+            call_id = str(raw.get("tool_call_id") or "")
+            if not call_id:
+                anonymous_seq += 1
+                call_id = f"anonymous_{anonymous_seq}"
+            tool_name = str(raw.get("tool_name") or "tool")
+
+            if event_type == "tool.started":
+                title = tool_name
+                preview = _compact(raw.get("preview"), 64)
+                if preview:
+                    title = f"{tool_name} - {preview}"
+                if call_id not in tasks:
+                    task_order.append(call_id)
+                tasks[call_id] = {
+                    "id": call_id,
+                    "title": _compact(title),
+                    "status": "in_progress",
+                }
+                return True
+
+            task = tasks.get(call_id)
+            if task is None:
+                # Completion-only events are rare but valid on some
+                # runtimes. Keep their real ID instead of guessing a
+                # same-name pending call.
+                task = {
+                    "id": call_id,
+                    "title": _compact(tool_name),
+                    "status": "in_progress",
+                }
+                tasks[call_id] = task
+                task_order.append(call_id)
+            task["status"] = "error" if raw.get("is_error") else "complete"
+            return True
+
+        async def _send_or_edit_fallback() -> None:
+            nonlocal fallback_msg_id
+            text = _fallback_text()
+            if fallback_msg_id:
+                result = await adapter.edit_message(
+                    chat_id=ctx.source.chat_id,
+                    message_id=fallback_msg_id,
+                    content=text,
+                    metadata=ctx._progress_metadata,
+                )
+                if getattr(result, "success", False):
+                    return
+            result = await adapter.send(
+                chat_id=ctx.source.chat_id,
+                content=text,
+                reply_to=ctx._progress_reply_to,
+                metadata=ctx._progress_metadata,
+            )
+            if getattr(result, "success", False) and getattr(
+                result, "message_id", None
+            ):
+                fallback_msg_id = str(result.message_id)
+                if ctx._cleanup_progress:
+                    ctx._cleanup_msg_ids.append(fallback_msg_id)
+
+        async def _publish_native_progress() -> None:
+            nonlocal native_failed
+            if not tasks:
+                return
+            if not native_failed:
+                result = await adapter.send_native_task_card_progress(
+                    chat_id=ctx.source.chat_id,
+                    tasks=_visible_tasks(),
+                    title="Hermes is working",
+                    reply_to=ctx._progress_reply_to,
+                    metadata=ctx._progress_metadata,
+                    fallback_text=_fallback_text(),
+                )
+                if getattr(result, "success", False):
+                    return
+                native_failed = True
+                logger.warning(
+                    "Slack native task-card progress failed; falling back "
+                    "to an editable text update: %s",
+                    getattr(result, "error", "unknown error"),
+                )
+            # Once the native rail fails, every later lifecycle event
+            # edits the same fallback message so progress remains live.
+            await _send_or_edit_fallback()
+
+        def _drain_native_queue() -> bool:
+            changed = False
+            while True:
+                try:
+                    changed = _apply_native_event(
+                        ctx.progress_queue.get_nowait()
+                    ) or changed
+                except queue.Empty:
+                    return changed
+                except Exception:
+                    logger.debug(
+                        "Slack native progress queue drain failed",
+                        exc_info=True,
+                    )
+                    return changed
+
+        def _agent_interrupted() -> bool:
+            try:
+                _agent = ctx.agent_holder[0] if ctx.agent_holder else None
+                return bool(
+                    _agent is not None and getattr(_agent, "is_interrupted", False)
+                )
+            except Exception:
+                return False
+
+        try:
+            while True:
+                if not ctx._run_still_current():
+                    return
+                try:
+                    raw = ctx.progress_queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                if _agent_interrupted():
+                    continue
+
+                if _apply_native_event(raw):
+                    await _publish_native_progress()
+        except asyncio.CancelledError:
+            if _drain_native_queue() and ctx._run_still_current():
+                if not _agent_interrupted():
+                    await _publish_native_progress()
+            return
+        finally:
+            if hasattr(adapter, "stop_native_task_card_progress"):
+                await adapter.stop_native_task_card_progress(
+                    ctx.source.chat_id,
+                    reply_to=ctx._progress_reply_to,
+                    metadata=ctx._progress_metadata,
+                )
+
     async def send_progress_messages(self):
         ctx = self._ctx
         if not ctx.progress_queue:
@@ -4078,6 +4307,12 @@ class TurnRunner:
 
         adapter = self._runner._adapter_for_source(ctx.source)
         if not adapter:
+            return
+
+        if ctx._native_slack_task_cards and hasattr(
+            adapter, "send_native_task_card_progress"
+        ):
+            await self._send_native_task_card_progress(adapter)
             return
 
         # Skip tool progress for platforms that don't support message
@@ -4446,6 +4681,68 @@ class TurnRunner:
             )
         except Exception as _ack_err:
             logger.debug("voice ack schedule failed: %s", _ack_err)
+
+    # ── Slack-native task cards: ID-bearing lifecycle callbacks (#29483) ──
+    # These ride agent.tool_start_callback / agent.tool_complete_callback so
+    # start/completion events correlate by the REAL tool-call id — the
+    # name-correlated text events in progress_callback would duplicate cards
+    # and mispair concurrent calls to the same tool.
+
+    def native_tool_start_callback(self, call_id, tool_name, args):
+        """Queue an ID-correlated native progress start from the agent thread."""
+        ctx = self._ctx
+        if not ctx.progress_queue or not ctx._run_still_current():
+            return
+        try:
+            _agent = ctx.agent_holder[0] if ctx.agent_holder else None
+            if _agent is not None and getattr(_agent, "is_interrupted", False):
+                return
+        except Exception:
+            pass
+        from agent.display import build_tool_preview
+
+        ctx.progress_queue.put(
+            {
+                "type": "tool.started",
+                "tool_call_id": str(call_id or ""),
+                "tool_name": str(tool_name or "tool"),
+                "preview": build_tool_preview(
+                    str(tool_name or "tool"), args or {}, max_len=64
+                )
+                or "",
+            }
+        )
+
+    def native_tool_complete_callback(self, call_id, tool_name, args, result):
+        """Queue the matching native completion using the real tool-call ID."""
+        ctx = self._ctx
+        if not ctx.progress_queue or not ctx._run_still_current():
+            return
+        try:
+            _agent = ctx.agent_holder[0] if ctx.agent_holder else None
+            if _agent is not None and getattr(_agent, "is_interrupted", False):
+                return
+        except Exception:
+            pass
+        from agent.display import _detect_tool_failure
+
+        is_error, _ = _detect_tool_failure(str(tool_name or "tool"), result)
+        ctx.progress_queue.put(
+            {
+                "type": "tool.completed",
+                "tool_call_id": str(call_id or ""),
+                "tool_name": str(tool_name or "tool"),
+                "is_error": bool(is_error),
+            }
+        )
+
+    def combined_tool_start_callback(self, call_id, tool_name, args):
+        """Compose the voice ack + native task-card start consumers."""
+        ctx = self._ctx
+        if ctx._voice_ack_guild[0] is not None:
+            self.voice_ack_callback(call_id, tool_name, args)
+        if ctx._native_slack_task_cards:
+            self.native_tool_start_callback(call_id, tool_name, args)
 
     def _step_callback_sync(self, iteration: int, prev_tools: list) -> None:
         ctx = self._ctx
@@ -5045,10 +5342,23 @@ class TurnRunner:
             )
             else None
         )
-        # Discord voice verbal-ack hook (fires once per turn on first tool
-        # call; armed only when in a voice channel with the mixer running).
+        # Compose ID-bearing lifecycle consumers: Discord's one-time voice
+        # ack and Slack's native task cards both ride the authoritative
+        # start callback, so neither has to infer identity from tool names.
+        _combined_start_cb = ctx.native_tool_start_callback or ctx.voice_ack_callback
         agent.tool_start_callback = (
-            ctx.voice_ack_callback if ctx._voice_ack_guild[0] is not None else None
+            _combined_start_cb
+            if (
+                ctx._voice_ack_guild[0] is not None
+                or ctx._native_slack_task_cards
+            )
+            else None
+        )
+        agent.tool_complete_callback = (
+            ctx.native_tool_complete_callback
+            if ctx._native_slack_task_cards
+            and ctx.native_tool_complete_callback is not None
+            else None
         )
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
@@ -5856,6 +6166,10 @@ class TurnRunner:
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
+            "compression_exhausted": (
+                ctx.result_holder[0].get("compression_exhausted", False)
+                if ctx.result_holder[0] else False
+            ),
             # Soft lock-contention defer (#69870 consumer): distinct from
             # compression_exhausted so the gateway never auto-resets a
             # session that a concurrent compressor is about to shrink.
@@ -7385,6 +7699,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "config": platform_config,
             "attempts": 0,
             "next_retry": time.monotonic(),
+            "queued_at": time.monotonic(),
             "credential_claim": self._adapter_credential_claim(
                 adapter.platform, adapter
             ),
@@ -8216,14 +8531,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_state: Optional[str] = None,
         error_code: Optional[str] = None,
         error_message: Optional[str] = None,
+        needs_attention: Optional[bool] = None,
+        retrying_since: Any = _UNSET,
     ) -> None:
         try:
             from gateway.status import write_runtime_status
+            extra: Dict[str, Any] = {}
+            if needs_attention is not None:
+                extra["needs_attention"] = needs_attention
+            if retrying_since is not _UNSET:
+                extra["retrying_since"] = retrying_since
             write_runtime_status(
                 platform=platform,
                 platform_state=platform_state,
                 error_code=error_code,
                 error_message=error_message,
+                **extra,
             )
         except Exception:
             pass
@@ -9048,7 +9371,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
+        security_metadata_keys = (
+            "hermes_plugin_id",
+            "hermes_plugin_injection",
+            "gateway_session_key",
+            "gateway_session_id",
+            "gateway_session_strict",
+        )
+        same_security_context = existing is not None and (
+            getattr(existing, "internal", False) == getattr(event, "internal", False)
+            and getattr(existing, "allow_gateway_control", True)
+            == getattr(event, "allow_gateway_control", True)
+            and all(
+                (getattr(existing, "metadata", None) or {}).get(key)
+                == (getattr(event, "metadata", None) or {}).get(key)
+                for key in security_metadata_keys
+            )
+        )
+        if same_security_context and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
@@ -9180,7 +9520,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # we deliver it ourselves (mirroring the draining-case send above).
         try:
             from tools.approval import has_blocking_approval
-            if has_blocking_approval(session_key):
+            if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
                 _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
@@ -9245,9 +9585,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (the default busy_text_mode) aborts the active turn AND sends a "⚡
         # Interrupting current task" ack — exactly the opposite of the design
         # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
+        # never splices into a running turn. Plugin events carry untrusted
+        # payload text, so queue those through the gateway FIFO to keep their
+        # security metadata separate from pending user input.
+        if getattr(event, "internal", False) and not event.allow_gateway_control:
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
         if getattr(event, "internal", False):
             return False
 
@@ -11526,6 +11869,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter.set_platform_event_handler(self._primary_platform_event_handler())
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -11555,6 +11899,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_state="connected",
                         error_code=None,
                         error_message=None,
+                        needs_attention=False,
+                        retrying_since=None,
                     )
                     logger.info("✓ %s connected", platform.value)
                 else:
@@ -11589,6 +11935,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "config": platform_config,
                                 "attempts": 1,
                                 "next_retry": time.monotonic() + 30,
+                                "queued_at": time.monotonic(),
                                 "credential_claim": self._adapter_credential_claim(
                                     platform, adapter
                                 ),
@@ -11611,6 +11958,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "config": platform_config,
                             "attempts": 1,
                             "next_retry": time.monotonic() + 30,
+                            "queued_at": time.monotonic(),
                             "credential_claim": self._adapter_credential_claim(
                                 platform, adapter
                             ),
@@ -11636,6 +11984,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "config": platform_config,
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
+                    "queued_at": time.monotonic(),
                     "credential_claim": self._adapter_credential_claim(
                         platform, adapter
                     ),
@@ -11776,6 +12125,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
+        self._install_plugin_message_injector()
         self._update_runtime_status("running")
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
@@ -12878,6 +13228,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # /platform resume to come back.
                 if info.get("paused"):
                     continue
+                # Long-lived retry-loop escalation (OOF-156): once a platform
+                # has been continuously queued past the attention threshold,
+                # flag it NEEDS_ATTENTION in runtime status so owners and
+                # fleet monitoring see "this is not a blip" — a dead token,
+                # revoked intent, or crash-looping sidecar otherwise presents
+                # as ordinary "retrying" forever. Retries continue unchanged:
+                # this is a signal, NOT a circuit breaker (auto-pause was
+                # deliberately removed — see this docstring's history).
+                if not info.get("attention_flagged") and _reconnect_needs_attention(info, now):
+                    info["attention_flagged"] = True
+                    queued_for = now - info.get("queued_at", now)
+                    retrying_since_iso = (
+                        datetime.now(timezone.utc) - timedelta(seconds=queued_for)
+                    ).isoformat()
+                    logger.warning(
+                        "%s has been failing/reconnecting continuously for "
+                        "%.1f hours (%d attempts) — flagging NEEDS_ATTENTION. "
+                        "Retries continue, but this usually means a permanent "
+                        "problem (revoked credentials, missing intents, broken "
+                        "sidecar). Check `hermes status` / `/platform list`.",
+                        platform.value,
+                        queued_for / 3600.0,
+                        info.get("attempts", 0),
+                    )
+                    self._update_platform_runtime_status(
+                        platform.value,
+                        platform_state="retrying",
+                        needs_attention=True,
+                        retrying_since=retrying_since_iso,
+                    )
                 if now < info["next_retry"]:
                     continue  # not time yet
 
@@ -12919,6 +13299,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _set_reaction(self._handle_reaction_event)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    adapter.set_platform_event_handler(self._primary_platform_event_handler())
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -12940,6 +13321,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             platform_state="connected",
                             error_code=None,
                             error_message=None,
+                            needs_attention=False,
+                            retrying_since=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
@@ -13247,6 +13630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return time.monotonic() - _stop_started_at
 
             self._running = False
+            self._clear_plugin_message_injector()
             self._draining = True
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
@@ -13754,6 +14138,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         with _profile_runtime_scope(profile_home):
             profile_runtime_cfg = _load_gateway_runtime_config()
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
@@ -13899,6 +14286,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
+        )
+        adapter.set_platform_event_handler(
+            self._make_profile_platform_event_handler(profile_name)
         )
         text_modes = getattr(self, "_busy_text_modes_by_profile", None)
         adapter._busy_text_mode = (
@@ -14132,6 +14522,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(self.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
         return self._handle_message
+
+    async def _handle_gateway_platform_event(self, event: dict, source) -> None:
+        """Authorize and publish one normalized adapter event to plugin hooks."""
+        try:
+            from hermes_cli.lifecycle import has_hook, invoke_hook
+
+            if not has_hook("gateway_platform_event"):
+                return
+            if not self._is_user_authorized(source):
+                return
+            invoke_hook("gateway_platform_event", **event)
+        except Exception:
+            # Observer failures must never break the adapter's update loop.
+            logger.debug("gateway_platform_event hook dispatch failed", exc_info=True)
+
+    def _make_profile_platform_event_handler(self, profile_name: str):
+        """Bind platform-event auth and hook dispatch to one multiplex profile."""
+        from hermes_cli.profiles import get_profile_dir
+
+        try:
+            profile_home = get_profile_dir(profile_name)
+        except Exception:
+            profile_home = None
+
+        async def _handler(event, source):
+            if getattr(source, "profile", None) is None:
+                source.profile = profile_name
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_gateway_platform_event(event, source)
+            return await self._handle_gateway_platform_event(event, source)
+
+        return _handler
+
+    def _make_default_profile_platform_event_handler(self):
+        """Scope primary-transport events to their routed multiplex profile."""
+
+        async def _handler(event, source):
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return await self._handle_gateway_platform_event(event, source)
+
+        return _handler
+
+    def _primary_platform_event_handler(self):
+        if getattr(self.config, "multiplex_profiles", False):
+            return self._make_default_profile_platform_event_handler()
+        return self._handle_gateway_platform_event
 
     @staticmethod
     def _adapter_credential_claim(
@@ -15172,8 +15609,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
-        if _up_state is not None and _up_state.persistent.update_prompt_pending:
+        if (
+            allow_gateway_control
+            and _up_state is not None
+            and _up_state.persistent.update_prompt_pending
+        ):
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
             cmd = event.get_command()
@@ -15252,7 +15694,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
+        if (
+            allow_gateway_control
+            and _pending_clarify is not None
+            and _clarify_mod is not None
+        ):
             _clarify_has_audio = bool(self._pending_event_audio_paths(event))
             _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
             if _clarify_has_audio and not _raw_clarify_reply:
@@ -15314,7 +15760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _tool_approval_live = has_blocking_approval(_quick_key)
         except Exception:
             _tool_approval_live = False
-        if _pending_confirm and not _tool_approval_live:
+        if allow_gateway_control and _pending_confirm and not _tool_approval_live:
             _raw_reply = (event.text or "").strip()
             # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim.
             # Slack/Matrix instruction text shows the `!` prefix (typed `/`
@@ -15659,6 +16105,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
                 return _denied
+
+        # pre_command observer hook (#64204): fires for every recognized
+        # slash command BEFORE core handling, mirroring the CLI fire-site in
+        # cli.py process_command. Observer-only in v1 (returns ignored).
+        #
+        # Placement matters: this cold-path dispatch is only reached when NO
+        # agent is running for the session. The running-agent intercept path
+        # above (/stop, /approve, busy_policy dispatch via
+        # _dispatch_busy_slash_command) deliberately does NOT fire this hook —
+        # those are control-plane operations on an in-flight run, and giving
+        # plugins an observation (and eventually veto) point there would let
+        # a slow or hostile plugin interfere with the operator's escape
+        # hatches for a live agent.
+        if command and is_gateway_known_command(canonical):
+            try:
+                from hermes_cli.plugins import fire_pre_command_hook
+                fire_pre_command_hook(
+                    surface="gateway",
+                    command=str(canonical),
+                    alias_used=str(command),
+                    args_raw=event.get_command_args().strip(),
+                    session_key=_quick_key,
+                    platform=source.platform.value if source.platform else "",
+                )
+            except Exception as _pre_cmd_err:
+                logger.debug(
+                    "pre_command hook dispatch failed (non-fatal): %s",
+                    _pre_cmd_err,
+                )
 
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
@@ -16385,7 +16860,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # on error. Let the user drive the next turn.
                 if _final_text.strip():
                     try:
-                        session_entry = await self.async_session_store.get_or_create_session(source)
+                        session_entry = await self.async_session_store.get_or_create_session(
+                            source,
+                            touch_activity=not is_internal,
+                        )
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
@@ -17008,6 +17486,156 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except AttributeError:
                     pass
 
+    def _install_plugin_message_injector(self) -> None:
+        """Publish this live gateway's plugin message scheduler."""
+        from hermes_cli.plugins import get_plugin_manager
+
+        get_plugin_manager().set_gateway_message_injector(
+            self,
+            self._schedule_plugin_message_injection,
+        )
+
+    def _clear_plugin_message_injector(self) -> None:
+        """Remove this runner's scheduler without clobbering a newer owner."""
+        from hermes_cli.plugins import get_plugin_manager
+
+        get_plugin_manager().clear_gateway_message_injector(self)
+
+    def _schedule_plugin_message_injection(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        plugin_id: str,
+    ) -> bool:
+        """Schedule a plugin-triggered turn on the live gateway loop."""
+        loop = getattr(self, "_gateway_loop", None)
+        if not getattr(self, "_running", False) or loop is None or loop.is_closed():
+            return False
+
+        coro = self._dispatch_plugin_message_injection(
+            session_key=session_key,
+            content=content,
+            plugin_id=plugin_id,
+        )
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is loop:
+            try:
+                future = loop.create_task(coro)
+            except Exception:
+                coro.close()
+                logger.warning(
+                    "Plugin message injection scheduling failed",
+                    exc_info=True,
+                )
+                return False
+            self._background_tasks.add(future)
+            future.add_done_callback(self._background_tasks.discard)
+        else:
+            future = safe_schedule_threadsafe(
+                coro,
+                loop,
+                logger=logger,
+                log_message="Plugin message injection scheduling failed",
+                log_level=logging.WARNING,
+            )
+            if future is None:
+                return False
+
+        def _log_result(completed) -> None:
+            try:
+                accepted = completed.result()
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                return
+            except Exception:
+                logger.warning(
+                    "Plugin message injection failed: plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                    exc_info=True,
+                )
+                return
+            if not accepted:
+                logger.warning(
+                    "Plugin message injection was not routed: plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                )
+
+        future.add_done_callback(_log_result)
+        return True
+
+    async def _dispatch_plugin_message_injection(
+        self,
+        *,
+        session_key: str,
+        content: str,
+        plugin_id: str,
+    ) -> bool:
+        """Route a plugin-triggered turn through the session's live adapter."""
+        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return False
+
+        entry = await self.async_session_store.lookup_by_session_key(session_key)
+        if entry is None or entry.origin is None:
+            return False
+        if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return False
+
+        source = dataclasses.replace(entry.origin)
+        try:
+            if not self._is_user_authorized(
+                source,
+                allow_adapter_delegation=False,
+            ):
+                logger.warning(
+                    "Plugin message injection denied by current gateway authorization: "
+                    "plugin=%s session=%s",
+                    plugin_id,
+                    session_key,
+                )
+                return False
+        except Exception:
+            logger.warning(
+                "Plugin message injection authorization check failed: "
+                "plugin=%s session=%s",
+                plugin_id,
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+
+        event = MessageEvent(
+            text=content,
+            message_type=MessageType.TEXT,
+            source=source,
+            internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": plugin_id,
+                "hermes_plugin_injection": True,
+                "gateway_session_key": session_key,
+                "gateway_session_id": entry.session_id,
+                "gateway_session_strict": True,
+            },
+        )
+        await adapter.handle_message(event)
+        logger.info(
+            "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
+            plugin_id,
+            session_key,
+            entry.session_id,
+        )
+        return True
+
     def _get_cached_session_source(self, session_key: str):
         if not session_key:
             return None
@@ -17051,12 +17679,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = await self.async_session_store.get_or_create_session(source)
-        session_key = session_entry.session_key
-        pinned_session_id = str(
-            (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
+        event_metadata = getattr(event, "metadata", None) or {}
+        expected_session_key = str(
+            event_metadata.get("gateway_session_key") or ""
         ).strip()
-        if pinned_session_id:
+        if expected_session_key:
+            derived_session_key = self._session_key_for_source(source)
+            if derived_session_key != expected_session_key:
+                logger.warning(
+                    "Dropping internally routed event after route recovery: "
+                    "expected session=%s derived=%s",
+                    expected_session_key,
+                    derived_session_key,
+                )
+                return
+
+        strict_session = bool(event_metadata.get("gateway_session_strict"))
+        pinned_session_id = str(event_metadata.get("gateway_session_id") or "").strip()
+        if strict_session:
+            session_entry = await self.async_session_store.lookup_by_session_key(
+                expected_session_key
+            )
+            if (
+                session_entry is None
+                or not pinned_session_id
+                or session_entry.session_id != pinned_session_id
+            ):
+                logger.warning(
+                    "Dropping internally routed event: expected session id=%s is no "
+                    "longer current for key=%s",
+                    pinned_session_id or "missing",
+                    expected_session_key or "missing",
+                )
+                return
+        else:
+            # Internal wakes must observe reset policy without becoming user
+            # activity themselves. Otherwise periodic Kanban/process
+            # notifications keep the stable routing key alive across every
+            # daily/idle boundary.
+            session_entry = await self.async_session_store.get_or_create_session(
+                source,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
+        session_key = session_entry.session_key
+        if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(
                 session_entry,
                 pinned_session_id,
@@ -18855,6 +19521,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self.async_session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                touch_activity=not bool(getattr(event, "internal", False)),
             )
 
             # Re-baseline the cached agent's message_count snapshot now that
@@ -19482,7 +20149,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal manager unavailable: %s", exc)
             return None, None
         try:
-            session_entry = await self.async_session_store.get_or_create_session(event.source)
+            # Session lookups on behalf of an internal event must not advance
+            # the user-activity clock that drives idle/daily reset policy
+            # (same class as the wake fix in _handle_message_with_agent).
+            session_entry = await self.async_session_store.get_or_create_session(
+                event.source,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
         except Exception as exc:
             logger.debug("goal manager: session lookup failed: %s", exc)
             return None, None
@@ -19503,7 +20176,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("heartbeat manager unavailable: %s", exc)
             return None, None
         try:
-            session_entry = await self.async_session_store.get_or_create_session(event.source)
+            # Same reset-policy contract as _get_goal_manager_for_event:
+            # internal events look up the session without touching activity.
+            session_entry = await self.async_session_store.get_or_create_session(
+                event.source,
+                touch_activity=not bool(getattr(event, "internal", False)),
+            )
         except Exception as exc:
             logger.debug("heartbeat manager: session lookup failed: %s", exc)
             return None, None
@@ -20320,6 +20998,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
 
+    def _resolve_enabled_toolsets_for_source(
+        self,
+        user_config: dict,
+        source: "SessionSource",
+        platform_key: str,
+    ) -> list:
+        """Resolve enabled toolsets for an agent run, honoring per-source overrides.
+
+        Asks the receiving adapter for a ``toolsets_for_source()`` override
+        (e.g. per-route webhook toolsets). When present, the override list is
+        validated through the SAME ``_get_platform_tools`` path as normal
+        platform config — by substituting it as the platform's toolset list —
+        so unknown names and platform-restricted toolsets are dropped rather
+        than trusted. When absent, falls back to standard
+        ``platform_toolsets.<platform>`` resolution.
+        """
+        from hermes_cli.tools_config import _get_platform_tools
+
+        override = None
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                override = adapter.toolsets_for_source(source)
+        except Exception:
+            override = None
+
+        if override and isinstance(override, list):
+            cfg = dict(user_config)
+            pts = dict(cfg.get("platform_toolsets") or {})
+            pts[platform_key] = [str(t) for t in override]
+            cfg["platform_toolsets"] = pts
+            return sorted(_get_platform_tools(cfg, platform_key))
+
+        return sorted(_get_platform_tools(user_config, platform_key))
+
     async def _run_background_task_inner(
         self,
         prompt: str,
@@ -20358,8 +21071,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             platform_key = _platform_config_key(source.platform)
 
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = self._resolve_enabled_toolsets_for_source(
+                user_config, source, platform_key
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -22225,6 +22939,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
+            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
@@ -22497,7 +23212,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result = await asyncio.to_thread(
+                    transcribe_audio, path, None, "gateway",
+                )
                 if not result.get("success"):
                     fallback = await asyncio.to_thread(
                         transcribe_audio_local_fallback,
@@ -25456,8 +26173,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
 
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._resolve_enabled_toolsets_for_source(
+            user_config, source, platform_key
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -25597,7 +26315,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        # Slack-native task cards (#29483): when the Slack adapter's opt-in
+        # is set, tool progress renders as native plan/task cards via
+        # chat.startStream — the progress queue is needed even though Slack
+        # keeps ordinary text tool_progress off by default (requiring both
+        # flags would silently leave the native feature inactive).
+        _progress_adapter_for_native = self._adapter_for_source(source)
+        _native_slack_task_cards = False
+        if (
+            source.platform == Platform.SLACK
+            and _progress_adapter_for_native is not None
+            and hasattr(_progress_adapter_for_native, "native_task_cards_enabled")
+        ):
+            try:
+                _native_slack_task_cards = bool(
+                    _progress_adapter_for_native.native_task_cards_enabled()
+                )
+            except Exception:
+                logger.debug("Slack native task-card config check failed", exc_info=True)
+        needs_progress_queue = (
+            tool_progress_enabled or _thinking_enabled or _native_slack_task_cards
+        )
 
 
         # Queue for progress messages (thread-safe)
@@ -25689,6 +26427,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,
+            _native_slack_task_cards=_native_slack_task_cards,
             _voice_ack_fired=_voice_ack_fired,
             _voice_ack_guild=_voice_ack_guild,
             _voice_ack_loop=_voice_ack_loop,
@@ -25709,6 +26448,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # TurnRunner.progress_callback (bound method, same signature).
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
+        turn_ctx.native_tool_start_callback = turn_runner.combined_tool_start_callback
+        turn_ctx.native_tool_complete_callback = (
+            turn_runner.native_tool_complete_callback
+        )
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -25786,6 +26529,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # reply anchor; carry it so progress joins that thread.
             _progress_metadata = {"reply_to_message_id": event_message_id}
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        if _native_slack_task_cards:
+            # chat.startStream in channels requires the recipient team/user
+            # pair; harmless extras elsewhere, so stamp them whenever known.
+            _progress_metadata = dict(_progress_metadata or {})
+            if source.scope_id:
+                _progress_metadata.setdefault("recipient_team_id", source.scope_id)
+                _progress_metadata.setdefault("slack_team_id", source.scope_id)
+            if source.user_id:
+                _progress_metadata.setdefault("recipient_user_id", source.user_id)
         _progress_reply_to = (
             event_message_id
             if (
@@ -27449,6 +28201,19 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _stop_cron_provider(provider) -> None:
+    """Stop a cron provider without letting it choose the gateway exit code."""
+    try:
+        provider.stop()
+    except SystemExit as exc:
+        logger.warning(
+            "Cron provider stop() attempted to exit the gateway with code %s; ignoring",
+            exc.code,
+        )
+    except Exception as exc:
+        logger.debug("Cron provider stop() error: %s", exc)
+
+
 # Upper bound for cooperatively draining the cron ticker on shutdown. The cron
 # thread delivers via ``safe_schedule_threadsafe`` and blocks on
 # ``future.result(timeout=60)`` (see cron/scheduler.py::_deliver_result), so a
@@ -28112,10 +28877,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # silently dropped (#58818). Awaiting keeps the loop alive so the in-flight
     # delivery finishes before we tear down.
     cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
+    _stop_cron_provider(cron_provider)
     if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning(
             "Cron ticker did not exit within %.0fs of shutdown — an in-flight "
