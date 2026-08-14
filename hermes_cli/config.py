@@ -1930,6 +1930,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "require_mention",       # top-level convenience form honored by the gateway (#3979)
     "unauthorized_dm_behavior",  # top-level form read by gateway/config.py
     "signal",            # Signal settings bridged to env vars by gateway/config.py
+    "timeouts",          # unified timeout resolution section (agent/deadline.py, #85125)
 }
 _KNOWN_ROOT_KEYS = frozenset(DEFAULT_CONFIG.keys()) | _EXTRA_KNOWN_ROOT_KEYS
 
@@ -4941,6 +4942,7 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "server_actions",
     "secrets",
     "goals",
+    "loops",
 })
 
 # Top-level keys whose sub-keys are partially schema-defined (e.g. on a

@@ -834,6 +834,37 @@ def _(rid, params: dict) -> dict:
             {"type": "send", "notice": notice, "message": state.goal},
         )
 
+    if name == "loop":
+        # /loop — recurring in-session wakeups (Claude Code parity). State
+        # mutation via the shared dispatcher; the notification poller thread
+        # fires due wakeups into this session while it's idle.
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.loops import LoopManager, dispatch_loop_command
+        except Exception as exc:
+            return _err(rid, 5030, f"loops unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        mgr = LoopManager(session_id=sid_key)
+        result = dispatch_loop_command(mgr, arg)
+        output = result.get("output") or ""
+        if result.get("created"):
+            try:
+                from hermes_cli.loops import goal_blocks_loop_tick
+
+                if goal_blocks_loop_tick(sid_key):
+                    output += (
+                        "\nNote: an active /goal is driving this session — loop "
+                        "wakeups defer until the goal finishes, pauses, or parks."
+                    )
+            except Exception:
+                pass
+        return _ok(rid, {"type": "exec", "output": output})
+
     if name == "undo":
         # /undo [N]: back up N user turns (default 1), soft-delete the
         # truncated rows on disk, and prefill the composer with the text
@@ -1731,6 +1762,23 @@ def _(rid, params: dict) -> dict:
 @method("skills.manage")
 def _(rid, params: dict) -> dict:
     action, query = params.get("action", "list"), params.get("query", "")
+    # Optional profile scoping: list/install operate on that profile's
+    # skills dir (capabilities UIs manage a bot's skills from the main
+    # window). Search/browse/inspect hit the shared hub catalog — the
+    # override is harmless there and keeps the semantics uniform.
+    profile = str(params.get("profile") or "").strip()
+    token = None
+    if profile:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import set_hermes_home_override
+
+            profile_dir = get_profile_dir(profile)
+            if not profile_dir or not profile_dir.is_dir():
+                return _err(rid, 4064, f"profile '{profile}' not found")
+            token = set_hermes_home_override(str(profile_dir))
+        except Exception as e:
+            return _err(rid, 5024, str(e))
     try:
         if action == "list":
             from hermes_cli.banner import get_available_skills
@@ -1785,6 +1833,72 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4017, f"unknown skills action: {action}")
     except Exception as e:
         return _err(rid, 5024, str(e))
+    finally:
+        if token is not None:
+            try:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(token)
+            except Exception:
+                pass
+
+
+@method("mcp.catalog")
+def _(rid, params: dict) -> dict:
+    """Bundled MCP catalog with per-profile install/enable state.
+
+    Params: optional ``profile`` (defaults to the launch profile). Result:
+    ``{servers: [{name, description, installed, enabled, requires: [env
+    keys], transport}]}`` — the same catalog `hermes mcp` offers, so
+    capability UIs can present the full menu and know which entries need
+    setup (missing requires) before they'll work.
+    """
+    profile = str(params.get("profile") or "").strip()
+    token = None
+    try:
+        if profile:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import set_hermes_home_override
+
+            profile_dir = get_profile_dir(profile)
+            if not profile_dir or not profile_dir.is_dir():
+                return _err(rid, 4064, f"profile '{profile}' not found")
+            token = set_hermes_home_override(str(profile_dir))
+
+        from hermes_cli import mcp_catalog
+
+        out = []
+        for entry in mcp_catalog.list_catalog():
+            try:
+                requires = [str(k) for k in (getattr(entry, "env_keys", None) or [])]
+            except Exception:
+                requires = []
+            out.append(
+                {
+                    "name": entry.name,
+                    "description": getattr(entry, "description", "") or "",
+                    "installed": bool(mcp_catalog.is_installed(entry.name)),
+                    "enabled": bool(mcp_catalog.is_enabled(entry.name)),
+                    "requires": requires,
+                    # TransportSpec object — reduce to its kind string.
+                    "transport": str(
+                        getattr(getattr(entry, "transport", None), "kind", "")
+                        or getattr(entry, "transport", "")
+                        or "stdio"
+                    ),
+                }
+            )
+        return _ok(rid, {"servers": out})
+    except Exception as e:
+        return _err(rid, 5024, str(e))
+    finally:
+        if token is not None:
+            try:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(token)
+            except Exception:
+                pass
 
 
 @method("skills.reload")
