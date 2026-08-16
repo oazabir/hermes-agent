@@ -164,6 +164,47 @@ export function backendScopePrefix(connectionId: string): string {
   return `conn:${String(connectionId).trim()}::`
 }
 
+export interface RegistryLocalRoute {
+  /** Reuse the legacy v1 ensureBackend path — it already resolves to the
+   * app's own local runtime, so single-source behavior stays byte-identical. */
+  delegate: boolean
+  /** Pool key for the forced-local child when not delegating. */
+  poolKey: string
+}
+
+/**
+ * How the registry's 'local' entry resolves a backend for `profile`.
+ *
+ * The 'local' entry means THIS machine's runtime — always. The legacy
+ * ensureBackend() path instead follows the v1 connection.json routing table,
+ * where a global remote mode (or a per-profile remote override) resolves to a
+ * REMOTE descriptor. A migrated user whose v1 global mode was remote gets that
+ * remote as the registry primary AND keeps the mandatory 'local' entry, so
+ * delegating 'local' to the v1 route made the roster's "This device" rows
+ * enumerate and dial the remote box: every profile appeared twice (forcing
+ * -slug handles) and "local" agents talked to the remote.
+ *
+ * When the v1 route is already local we delegate (legacy path, byte-identical
+ * pool keys). When v1 says remote, the local entry spawns its own genuinely
+ * local child under a composite pool key: backendScopeKey('local', p) maps to
+ * the BARE profile key by design, and that slot may already hold the v1
+ * route's REMOTE descriptor — so the forced-local child pools under the
+ * `conn:local::<profile>` form instead (colons are invalid in profile names,
+ * so it cannot collide).
+ */
+export function resolveRegistryLocalRoute(
+  profile: null | string | undefined,
+  opts: { globalRemote?: boolean; profileRemoteOverride?: boolean } = {}
+): RegistryLocalRoute {
+  const profileKey = String(profile ?? '').trim() || 'default'
+
+  if (opts.globalRemote || opts.profileRemoteOverride) {
+    return { delegate: false, poolKey: `${backendScopePrefix(LOCAL_CONNECTION_ID)}${profileKey}` }
+  }
+
+  return { delegate: true, poolKey: profileKey }
+}
+
 // ── Union agent roster ──────────────────────────────────────────────────────
 
 export interface ConnectionAgents {
@@ -412,6 +453,43 @@ export function mergeConnectionInput(input: ConnectionInput, existing?: null | R
   }
 
   return merged
+}
+
+/**
+ * True when an edit changes how a connection is DIALED — endpoint, auth, or
+ * ssh routing fields — as opposed to a cosmetic label rename. Callers use
+ * this to decide whether live pooled backends / renderer sockets for the
+ * connection must be recycled after a save: a label-only edit keeps traffic
+ * flowing, while a url/token/host change means everything currently open
+ * points at the OLD target and must be torn down and re-dialed.
+ */
+export function connectionDialFieldsChanged(before: RegistryConnection, after: RegistryConnection): boolean {
+  if (before.kind !== after.kind) {
+    return true
+  }
+
+  const fields: (keyof RegistryConnection)[] = [
+    'url',
+    'authMode',
+    'org',
+    'host',
+    'user',
+    'port',
+    'keyPath',
+    'remoteHermesPath',
+    'remoteProfile'
+  ]
+
+  for (const field of fields) {
+    if ((before[field] ?? null) !== (after[field] ?? null)) {
+      return true
+    }
+  }
+
+  // Token envelopes are opaque here (main.ts encrypts). An edit that carries
+  // no new token inherits the stored envelope verbatim, so structural
+  // equality is exact for the label-only case.
+  return JSON.stringify(before.token ?? null) !== JSON.stringify(after.token ?? null)
 }
 
 // ── Registry-level operations (all pure: return a new registry) ────────────
