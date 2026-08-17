@@ -249,9 +249,10 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // Profile that profile-scoped REST settings (config/env/skills/tools/model/…)
 // should target. Mirrors $activeGatewayProfile, pushed in from the store via
 // setApiRequestProfile so this module needs no store import (avoids a cycle).
-// Electron main consumes request.profile to pick which backend *process* serves
-// the call; each pooled backend already has its own HERMES_HOME, so no backend
-// change is needed. Null → primary, so single-profile users are unaffected.
+// Electron main consumes request.profile as request scope. Local calls whose
+// REST handlers accept profile reuse the primary dashboard via ?profile=;
+// unscoped handlers retain a profile backend. Remote overrides still route to
+// their owning backend. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
 
 export function setApiRequestProfile(profile: null | string): void {
@@ -282,6 +283,15 @@ let _apiConnectionId: null | string = null
 
 export function setApiRequestConnection(connectionId: null | string): void {
   _apiConnectionId = connectionId || null
+}
+
+// Registry connection scope for a REST request. A registered remote gateway
+// owns its own state.db — cron jobs and their run sessions live THERE — so
+// requests for gateway-owned data must carry the connection id for the main
+// process to route them to that host (hermes:api's registry branch). Null /
+// 'local' resolves to no tag, keeping single-source users byte-identical.
+function connectionScoped(): { connectionId?: string } {
+  return _apiConnectionId ? { connectionId: _apiConnectionId } : {}
 }
 
 /** Registry connection id that connection-scoped WS calls should target
@@ -669,10 +679,8 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
   }
 }
 
-// Mutations take the owning `profile` so Electron routes them to that profile's
-// backend (remote pool or local primary) via request.profile — matching the
-// read path. A remote session's row lives only on its remote host, so a mutation
-// that hit the local primary would no-op or 404. Omit for the current/default.
+// Mutations take the owning `profile` so Electron can route them to the correct
+// remote backend or local profile scope. Omit for the current/default profile.
 export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...(profile ? { profile } : {}),
@@ -1545,6 +1553,7 @@ export function getCronJobs(profile?: string): Promise<CronJob[]> {
 
   return window.hermesDesktop.api<CronJob[]>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs${suffix}`,
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
@@ -1553,6 +1562,7 @@ export function getCronJobs(profile?: string): Promise<CronJob[]> {
 export function getCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`
   })
 }
@@ -1560,6 +1570,7 @@ export function getCronJob(jobId: string): Promise<CronJob> {
 export async function getCronJobRuns(jobId: string, limit = 20): Promise<SessionInfo[]> {
   const { runs } = await window.hermesDesktop.api<{ runs: SessionInfo[] }>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}`
   })
 
@@ -1572,6 +1583,7 @@ export async function getCronJobRuns(jobId: string, limit = 20): Promise<Session
 export async function getCronDeliveryTargets(): Promise<CronDeliveryTarget[]> {
   const { targets } = await window.hermesDesktop.api<{ targets: CronDeliveryTarget[] }>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: '/api/cron/delivery-targets'
   })
 
@@ -1581,6 +1593,7 @@ export async function getCronDeliveryTargets(): Promise<CronDeliveryTarget[]> {
 export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: '/api/cron/jobs',
     method: 'POST',
     body
@@ -1590,6 +1603,7 @@ export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
 export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
     method: 'PUT',
     body: { updates }
@@ -1599,6 +1613,7 @@ export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<C
 export function pauseCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause`,
     method: 'POST'
   })
@@ -1607,6 +1622,7 @@ export function pauseCronJob(jobId: string): Promise<CronJob> {
 export function resumeCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume`,
     method: 'POST'
   })
@@ -1615,6 +1631,7 @@ export function resumeCronJob(jobId: string): Promise<CronJob> {
 export function triggerCronJob(jobId: string): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger`,
     method: 'POST',
     timeoutMs: CRON_TRIGGER_REQUEST_TIMEOUT_MS
@@ -1624,6 +1641,7 @@ export function triggerCronJob(jobId: string): Promise<CronJob> {
 export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
     method: 'DELETE'
   })
@@ -1643,6 +1661,7 @@ export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
 export function getAutomationBlueprints(): Promise<{ blueprints: AutomationBlueprint[] }> {
   return window.hermesDesktop.api<{ blueprints: AutomationBlueprint[] }>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: '/api/cron/blueprints',
     timeoutMs: STARTUP_REQUEST_TIMEOUT_MS
   })
@@ -1654,6 +1673,7 @@ export function instantiateAutomationBlueprint(
 ): Promise<CronJob> {
   return window.hermesDesktop.api<CronJob>({
     ...profileScoped(),
+    ...connectionScoped(),
     path: `/api/cron/blueprints/instantiate?profile=${encodeURIComponent(profile)}`,
     method: 'POST',
     body
