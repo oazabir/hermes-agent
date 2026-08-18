@@ -453,7 +453,8 @@ busy flag.
 ```ts
 host.notify({ kind, message, title?, detail?, action? })  // toast; returns id
 host.notifyError(error, fallbackMessage)                   // toast an error
-ctx.os.notify({ title, body?, silent? })   // native OS notification (attributed to your plugin)
+ctx.os.notify({ title, body?, silent?, icon?, activate?, onActivate?, actions? })
+                                           // native OS notification (attributed to your plugin)
 ctx.os.openExternal(url)                   // OS default handler (browser, mail, spotify:) → Promise<boolean>
 ctx.os.revealPath(path)                    // reveal in Finder / Explorer → Promise<boolean>
 ctx.os.writeClipboard(text)                // system clipboard → Promise<boolean>
@@ -462,6 +463,11 @@ host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
                                            //   intent: 'in-place' (default) | 'stack' | 'tab' | 'window'
 host.newChat(profile?)                     // fresh chat draft, optionally in another profile
+host.openWorkspace(id, { render, title?, minWidth?, onClose? })
+                                           // dock a plugin-rendered tab into the MAIN
+                                           //   workspace zone and reveal it; returns a disposer
+host.paneVisibility(paneId)                // ReadableAtom<boolean> — is a contributed pane
+                                           //   actually on screen (its zone's active tab)?
 host.onEvent(type, fn)                     // gateway event stream ('*' = all); returns disposer
 host.logs(...)                             // tail an app log file
 host.status()                              // one-shot system status snapshot
@@ -478,6 +484,29 @@ cron, kanban, …). `host.requestProfile` accepts a descriptor from
 profile without changing the active chat or gateway. The profile-only overload is
 retained only for the sole-local/legacy topology; registry-aware plugins should pass
 the descriptor so two sources exposing the same profile name cannot collide.
+
+`host.openWorkspace(id, { render, title?, minWidth?, onClose? })` docks a
+plugin-rendered view into the **main workspace zone** — the same center area
+session tiles and previews use — as a tab, and reveals it. Re-calling it with
+the same `id` refreshes the content in place and re-fronts the tab instead of
+opening a duplicate. Closing the tab (the tab's Close control or ⌘W) tears the
+registration down and fires your `onClose`; the returned disposer closes it
+programmatically. Feature-detect it (`typeof host.openWorkspace ===
+'function'`) and fall back to a regular contributed pane on older desktop
+builds — Bot Mode's group-chat rooms are the reference consumer (main-window
+takeover when available, in-panel view otherwise).
+
+`host.paneVisibility(paneId)` returns a readonly reactive atom that is `true`
+while a contributed pane is actually on screen: present in the layout tree,
+not dismissed or hidden, its zone un-minimized, and holding its zone's active
+tab slot (a lone pane in its own zone counts). The id is the
+contribution-scoped pane id, `<pluginId>:<paneId>`. Atoms are memoized per id,
+so calling it in render is safe. Use it to register companion UI only while
+your pane is visible — Bot Mode's Cronjobs pane is the reference consumer: it
+registers while the Bots pane holds the sidebar tab and unregisters when the
+user tabs back to Sessions. Feature-detect on older desktops
+(`typeof host.paneVisibility === 'function'`) and fall back to
+always-registered behavior.
 
 `host.profileRoutes()` inventories every registered source in the current connection
 registry. Connect-on-demand SSH sources expose a credential-free `default` seed
@@ -530,6 +559,32 @@ approval/turn alerts use. It fires only while the user is away from Hermes
 they're looking at the app. Users can silence it per device under Settings ▸
 Notifications ▸ "Plugin notifications", and repeats from the same plugin are
 throttled, so treat it as a signal for genuinely notable events — not a log.
+
+Rich presentation + activation (extends the original `ctx.os` door):
+
+```ts
+ctx.os.notify({
+  title: 'New match found',
+  body: 'Someone matched your signal',
+  icon: '/abs/path/to/icon.png', // Electron Notification icon
+  // Body click → focus Hermes + navigate. Same vocabulary as OS deep links:
+  activate: 'hermes://index-network/intent/1',
+  // or: activate: '/index-network/intent/1'
+  // or: activate: { path: '/index-network/intent/1' }
+  onActivate: () => focusLocalState('1'), // optional renderer callback
+  actions: [
+    { id: 'open', label: 'Open', activate: 'hermes://index-network/intent/1' },
+    { id: 'dismiss', label: 'Dismiss', onAction: () => dismiss('1') },
+  ],
+})
+```
+
+`activate` is deeplink-compatible: `hermes://index-network/intent/1` and the
+hash path `/index-network/intent/1` resolve to the same in-app route (and the
+same `hermes://…` URL works as an OS deep link). Action buttons only render on
+signed macOS builds; elsewhere the body click still activates. Navigation only
+happens on user click — never from a background event alone.
+
 The other doors (`openExternal`, `revealPath`, `writeClipboard`) resolve
 `false` instead of throwing when the capability isn't available (older desktop
 shell, plain browser) — branch on the result rather than sniffing the bridge.
@@ -784,7 +839,7 @@ not treat this pipeline as a trust boundary.
 | Category | Exports |
 |----------|---------|
 | Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
-| Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `Contribution` |
+| Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `PluginNotificationAction`, `HermesOpenTarget`, `Contribution` |
 | Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
 | Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |

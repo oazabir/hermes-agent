@@ -2380,28 +2380,14 @@ if _config_path.exists():
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
         # Gateway settings (media delivery allowlist + recency trust + strict mode)
+        # Delegated to the shared bridge so standalone delivery entrypoints
+        # (manual `hermes cron run`, ticks without the gateway) apply the SAME
+        # policy translation — process parity for attachment filtering.
         _gateway_cfg = _cfg.get("gateway", {})
         if isinstance(_gateway_cfg, dict):
-            _strict = _gateway_cfg.get("strict")
-            if _strict is not None:
-                os.environ["HERMES_MEDIA_DELIVERY_STRICT"] = (
-                    "1" if _strict else "0"
-                )
-            _allow_dirs = _gateway_cfg.get("media_delivery_allow_dirs")
-            if _allow_dirs:
-                if isinstance(_allow_dirs, str):
-                    _allow_dirs_str = _allow_dirs
-                elif isinstance(_allow_dirs, (list, tuple)):
-                    _allow_dirs_str = os.pathsep.join(str(p) for p in _allow_dirs if p)
-                else:
-                    _allow_dirs_str = ""
-                if _allow_dirs_str:
-                    os.environ["HERMES_MEDIA_ALLOW_DIRS"] = _allow_dirs_str
-            _trust_recent = _gateway_cfg.get("trust_recent_files")
-            if _trust_recent is not None:
-                os.environ["HERMES_MEDIA_TRUST_RECENT_FILES"] = (
-                    "1" if _trust_recent else "0"
-                )
+            from gateway.media_policy import apply_media_policy_env
+
+            apply_media_policy_env(_cfg)
             _trust_recent_seconds = _gateway_cfg.get("trust_recent_files_seconds")
             if _trust_recent_seconds is not None:
                 os.environ["HERMES_MEDIA_TRUST_RECENT_SECONDS"] = str(_trust_recent_seconds)
@@ -6525,6 +6511,14 @@ class TurnRunner:
 
 
 
+# Sentinel for "no explicit session DB has been pinned on this runner", so the
+# ``_session_db`` property can distinguish "resolve from the active profile
+# scope" from a deliberate ``runner._session_db = None`` (which disables
+# DB-backed commands and is how many suites construct a bare runner).  A plain
+# ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
+_SESSION_DB_UNPINNED = object()
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -6933,11 +6927,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
-        # Initialize session database for session_search tool support
-        self._session_db = None
+        # Initialize session database for session_search tool support.
+        #
+        # Same frozen-handle class of bug as SessionStore._db (#88532): a
+        # handle bound here is pinned to the process's root home, but
+        # /resume, /title, /history and session search all run inside
+        # _profile_runtime_scope on a multiplexed gateway and must see that
+        # profile's own state.db.  Resolve through a property that caches
+        # one AsyncSessionDB per resolved path; priming here keeps startup
+        # diagnostics (the #88235 broadcast) at construction time.
+        self._session_db_pinned: Any = _SESSION_DB_UNPINNED
+        self._session_db_handles: Dict[Path, Any] = {}
+        self._session_db_handles_lock = threading.Lock()
         try:
-            from hermes_state import AsyncSessionDB, SessionDB
-            self._session_db = AsyncSessionDB(SessionDB())
+            self._open_session_db_for_active_scope(raise_on_error=True)
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
@@ -7049,6 +7052,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
 
+
+    def _open_session_db_for_active_scope(self, raise_on_error: bool = False) -> Any:
+        """Return the AsyncSessionDB for the profile scope active on this task.
+
+        Same per-path cache as ``SessionStore._open_session_db_for_active_scope``
+        (#88532): ``SessionDB()`` resolves ``_default_db_path()`` at call time
+        through the context-local HERMES_HOME override installed by
+        ``_profile_runtime_scope``, so resolving per access — instead of once
+        in ``__init__`` — is what lets /resume, /title, /history and session
+        search on a multiplexed gateway read the *serving profile's* store
+        rather than the root one.
+
+        One ``AsyncSessionDB`` is cached per resolved path under a lock, so
+        the wrapper identity is stable per profile (callers compare and stash
+        it) and two profiles never share a handle.  A construction failure is
+        cached as ``None`` for that path so a broken store degrades once, not
+        per command; ``raise_on_error=True`` (construction-time priming)
+        propagates the failure instead so ``__init__`` can record
+        ``_session_db_init_error`` for the #88235 broadcast.
+        """
+        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path
+
+        path = Path(_default_db_path())
+        with self._session_db_handles_lock:
+            if path in self._session_db_handles:
+                return self._session_db_handles[path]
+            db = None
+            try:
+                db = AsyncSessionDB(SessionDB())
+            except Exception as e:
+                if raise_on_error:
+                    raise
+                logger.warning("SQLite session store not available: %s", e)
+            self._session_db_handles[path] = db
+            return db
+
+    @property
+    def _session_db(self) -> Any:
+        """The AsyncSessionDB for the active profile scope, or a pinned override.
+
+        Assigning ``runner._session_db`` pins that value for every subsequent
+        read — tests rely on installing fakes or ``None`` this way.  Unpinned
+        (the production path), each read resolves the active scope so a
+        multiplexed profile's slash commands and session search hit its own
+        store.
+        """
+        if self._session_db_pinned is not _SESSION_DB_UNPINNED:
+            return self._session_db_pinned
+        return self._open_session_db_for_active_scope()
+
+    @_session_db.setter
+    def _session_db(self, value) -> None:
+        self._session_db_pinned = value
+
+    def close_all_session_db_handles(self) -> None:
+        """Close every per-profile AsyncSessionDB this runner opened.
+
+        Shutdown counterpart of the per-path cache above; mirrors
+        ``SessionStore.close_all_db_handles``.  Handles are drained under the
+        lock and closed outside it; a pinned handle is the pinner's to close.
+        """
+        with self._session_db_handles_lock:
+            handles = [db for db in self._session_db_handles.values() if db is not None]
+            self._session_db_handles.clear()
+        for db in handles:
+            inner = getattr(db, "_db", db)
+            if inner is None or not hasattr(inner, "close"):
+                continue
+            try:
+                inner.close()
+            except Exception as exc:
+                logger.debug("SessionDB close error during handle sweep: %s", exc)
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -14681,6 +14756,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _db.close()
                 except Exception as _e:
                     logger.debug("SessionDB close error: %s", _e)
+            # A multiplexed session_store caches one SessionDB per profile
+            # path (#88532); reading ``_db`` above only resolved the handle
+            # for the shutdown task's own (root) scope. Sweep the rest so
+            # secondary profiles' WAL locks are released before --replace
+            # brings a new gateway up on the same files.
+            _sweep = getattr(
+                getattr(self, "session_store", None), "close_all_db_handles", None
+            )
+            if _sweep is not None:
+                try:
+                    _sweep()
+                except Exception as _e:
+                    logger.debug("SessionDB handle sweep error: %s", _e)
+            # Same sweep for the runner's own per-profile session_search
+            # handles (slash commands resolve them under profile scopes).
+            try:
+                GatewayRunner.close_all_session_db_handles(self)
+            except Exception as _e:
+                logger.debug("Runner SessionDB handle sweep error: %s", _e)
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
@@ -29526,6 +29620,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         cleanup_screenshot_cache,
         cleanup_video_cache,
     )
+    from tools.tool_result_storage import cleanup_spillover_cache
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -29544,6 +29639,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         ("Audio", cleanup_audio_cache),
         ("Video", cleanup_video_cache),
         ("Screenshot", cleanup_screenshot_cache),
+        ("Spillover", cleanup_spillover_cache),
     )
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
