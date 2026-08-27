@@ -575,6 +575,33 @@ DEFAULT_CONFIG = {
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        # Consent to browse with the user's REAL logins for local browsing.
+        # When true, local browsing (the Browser Use CLI, or the built-in
+        # browser tools) runs on a Hermes-managed SNAPSHOT of the user's
+        # ACTIVE default-Chromium profile (Local State -> profile.last_used) —
+        # its cookies, logins and preferences copied in and re-synced when a
+        # fresh session launches — driven by Hermes' packaged Chromium. Only
+        # the active profile is copied. The snapshot is a non-default dir, so it
+        # sidesteps Chrome 136+'s block on debugging the default profile and
+        # never contends with the user's running browser. Turning this back off
+        # deletes the snapshot store (~/.hermes/browser-profile/) so copied
+        # credentials don't outlive consent. Only Chromium-family default
+        # browsers are supported (Chrome, Edge, Brave, Chromium); a non-Chromium
+        # default (e.g. Firefox) fails closed with a clear message. Default
+        # false. Also gates the browser_exec ``local`` argument, which forces a
+        # real-profile local session even under a cloud browser backend. Toggle
+        # in the desktop Settings → Browser section.
+        "use_real_profile": False,
+        # When real-profile browsing needs the browser closed (Windows: a
+        # running Chrome/Edge/Brave locks its cookie DB deny-all, so it must be
+        # fully quit before its profile can be copied), arm the "offer to close
+        # it" flow. This does NOT auto-kill: when the profile is locked the
+        # snapshot always blocks and the agent asks the user first; only on
+        # approval does it run `hermes browser close-profile` (terminates the
+        # browser process tree bound to that profile, losing unsaved tabs) and
+        # retry. Still locked afterward → stays blocked, no loop, no auto-kill.
+        # OFF by default. No effect on macOS/Linux (copy-while-running works).
+        "real_profile_autoclose": False,
         "allow_unsafe_evaluate": False,  # Legacy override: when true, browser_console(expression=...) bypasses the restrict_evaluate denylist entirely
         "restrict_evaluate": False,  # Opt-in denylist blocking sensitive JS primitives (cookies/storage/clipboard/network/form values) in browser_console(expression=...)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
@@ -1542,6 +1569,10 @@ DEFAULT_CONFIG = {
             "telegram": {"streaming": True},
             "discord": {"streaming": False},
             "slack": {"streaming": False},
+            # WeCom uses native streaming (msgtype: "stream") via
+            # aibot_respond_msg — opt in by default so the WeCom client
+            # renders the typing animation and cumulative content updates.
+            "wecom": {"streaming": True},
         },
         # Gateway runtime-metadata footer appended to the FINAL message of a turn
         # (disabled by default to keep replies minimal). When enabled, renders
@@ -1602,6 +1633,11 @@ DEFAULT_CONFIG = {
         # Set this to True to re-enable the surfaces with the understanding
         # that the numbers are a local lower-bound estimate, not billing.
         "show_token_analytics": False,
+        # IP addresses or bounded CIDR networks of reverse proxies allowed to
+        # supply X-Forwarded-Proto / X-Forwarded-For. Loopback remains trusted
+        # automatically. Wildcards and /0 networks are rejected so arbitrary
+        # clients cannot spoof their scheme or source address.
+        "trusted_proxies": [],
         # WebSocket keepalive for the dashboard/desktop web server (#79635).
         # Applied to NON-loopback binds only: loopback always disables the
         # protocol ping (see hermes_cli/web_server.py — an event-loop stall
@@ -2508,6 +2544,16 @@ DEFAULT_CONFIG = {
     #         table_formatting skill instead of emitting a Markdown table.
     "platform_hints": {},
 
+    # Plugin system settings. ``enabled`` / ``disabled`` are written by
+    # ``hermes plugins enable|disable`` and intentionally omitted here so an
+    # empty default does not clobber a user's allow-list on merge.
+    "plugins": {
+        # Wall-clock cap (seconds) for a single in-process Python plugin hook
+        # callback. Shell hooks keep their own per-entry ``timeout``. Set to 0
+        # to disable the cap (sync call on the agent thread). Capped at 600.
+        "hook_callback_timeout": 30,
+    },
+
     # Shell-script hooks — declarative bridge that invokes shell scripts
     # on plugin-hook events (pre_tool_call, post_tool_call, pre_llm_call,
     # subagent_stop, etc.).  Each entry maps an event name to a list of
@@ -2818,6 +2864,34 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        # Kernel lifetime:
+        #   per-call (default) — a fresh child process per execute_code call;
+        #     no state carries over. Today's behavior.
+        #   session            — one persistent kernel per (session owner,
+        #     mode, interpreter, cwd, tool-set): variables, imports, and
+        #     loaded data survive across calls AND across the user turns of
+        #     one conversation (the owner is the conversation's approval
+        #     session key; delegated subagent sessions get their own).
+        #     Kernels are disposed with their session (session clear/new),
+        #     reaped after kernel_idle_timeout seconds idle, and capped at
+        #     max_session_kernels live children process-wide (LRU evicted).
+        #     A timed-out or interrupted cell kills the kernel (state lost,
+        #     next call starts fresh), and the child environment is frozen
+        #     at kernel spawn — pass reset=true after changing env
+        #     passthrough. Tool RPC authority is rebound to each cell: a
+        #     later cell's tool calls run under that cell's approval and
+        #     session context, never the first cell's. Security scrubbing,
+        #     the tool whitelist, and output redaction are identical in
+        #     both modes. NOTE for per-script static policy (see
+        #     check_execute_code_guard): a persistent namespace lets cell
+        #     N+1 reach objects cell N created, which a single-cell static
+        #     scan cannot see — the runtime RPC boundary (allow-list, call
+        #     budget, per-cell authority) is the operative cross-cell
+        #     enforcement in this mode.
+        "kernel_mode": "per-call",
+        # Lifecycle bounds for kernel_mode: session.
+        "kernel_idle_timeout": 1800,
+        "max_session_kernels": 4,
     },
 
     # Tool Search (progressive disclosure for large tool surfaces).
