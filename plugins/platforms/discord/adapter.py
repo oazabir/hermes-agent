@@ -5915,6 +5915,11 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_steer(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/steer {prompt}".strip())
 
+        @tree.command(name="plan", description="Write a markdown implementation plan (no execution)")
+        @discord.app_commands.describe(task="What to plan. Leave empty to infer from the conversation.")
+        async def slash_plan(interaction: discord.Interaction, task: str = ""):
+            await self._run_simple_slash(interaction, f"/plan {task}".strip())
+
         @tree.command(name="compress", description="Compress conversation context")
         async def slash_compress(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/compress")
@@ -6695,6 +6700,27 @@ class DiscordAdapter(BasePlatformAdapter):
             int(str(entry).strip()) for entry in self._gate_csv_set(raw)
             if str(entry).strip().isdigit()
         }
+
+    def resolved_allowlist_user_ids(self) -> set:
+        """Numeric user IDs from the connect-time username resolution.
+
+        ``_resolve_allowed_usernames`` turns username-shaped
+        ``DISCORD_ALLOWED_USERS`` entries into numeric IDs and keeps the
+        authoritative result in ``self._allowed_user_ids``. The env-var
+        mirror of that result does NOT survive the gateway's per-turn .env
+        hot-reload (``load_hermes_dotenv(override=True)`` restores the raw
+        usernames from the file), so the gateway authz layer
+        (``GatewayAuthorizationMixin._is_user_authorized``) calls this to
+        union the resolved IDs back into the allowlist it builds from env.
+
+        Returns only numeric entries: usernames are not comparable to
+        ``source.user_id`` and the ``"*"`` wildcard is env-file-persistent
+        already (resolution preserves it in the file's value), so passing it
+        through here would only widen access on the gateway layer beyond
+        what the operator's current .env says.
+        """
+        allowed = getattr(self, "_allowed_user_ids", None) or set()
+        return {str(uid) for uid in allowed if str(uid).isdigit()}
 
     def _discord_allow_all_users(self) -> bool:
         """Per-profile DISCORD_ALLOW_ALL_USERS flag."""
