@@ -661,7 +661,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 # allowed_channels whitelist check -- must pass before thread
                 # auto-continuation too, same as the non-thread gating path.
                 allowed_channels = _channel_id_set(
-                    self._extra_or_env("allowed_channels", "MATTERMOST_ALLOWED_CHANNELS"))
+                    _extra_or_secret(self.config.extra, "allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", blank_is_unset=False))
                 if allowed_channels and channel_id not in allowed_channels:
                     logger.debug("Mattermost: ignoring message in non-allowed channel: %s", channel_id)
                     return
