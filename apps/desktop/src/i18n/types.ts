@@ -72,17 +72,15 @@ export interface Translations {
     opening: string
     waiting: string
     timeout: string
-    keepWaiting: string
     refresh: string
     statusError: string
     connectError: string
+    connectErrorFor: (app: string) => string
     unavailable: string
     ownerMissing: string
     search: string
     empty: string
     disclaimer: string
-    connectTitle: (app: string) => string
-    describe: (app: string) => string
     execution: string
   }
   sessionImport: {
@@ -609,6 +607,12 @@ export interface Translations {
       terminalFontPlaceholder: string
       terminalFontPreview: string
       terminalFontReset: string
+      chatFontTitle: string
+      chatFontDesc: string
+      chatFontPlaceholder: string
+      chatFontPreview: string
+      chatFontSample: string
+      chatFontReset: string
       translucencyTitle: string
       translucencyDesc: string
       translucencyGlassDesc: string
@@ -1150,6 +1154,7 @@ export interface Translations {
       setToMain: string
       change: string
       autoUseMain: string
+      inheritMainEffort: string
       providerDefault: string
       fallbackAdd: string
       fallbackEmpty: string
@@ -3457,22 +3462,18 @@ export interface Translations {
       lateAnswerHint: string
     }
     mcpSetup: {
-      installTitle: (server: string) => string
-      enableTitle: (server: string) => string
-      authorizeTitle: (server: string) => string
+      installTitle: string
+      enableTitle: string
+      authorizeTitle: string
       installAction: string
       enableAction: string
       authorizeAction: string
-      decline: string
-      declined: string
       installed: (server: string) => string
       enabled: (server: string) => string
       authorized: (server: string) => string
       failed: (server: string) => string
-      unanswered: string
       toolCount: (count: number) => string
       notInCatalog: (server: string) => string
-      catalogSource: string
       envRequired: string
       sendFailed: string
       reloadFailed: string
@@ -3489,6 +3490,19 @@ export interface Translations {
       copyQuery: string
       copyFile: string
       copyPath: string
+      failedCalls: (count: number) => string
+      skillActivity: {
+        loading: string
+        loaded: string
+        loadFailed: string
+        readingResource: string
+        readResource: string
+        resourceFailed: string
+        listing: string
+        listed: string
+        listFailed: string
+        unavailable: string
+      }
       outputAlt: string
       rawResponse: string
       copyActivity: string
@@ -3501,6 +3515,7 @@ export interface Translations {
       statusRecovered: string
       statusDone: string
       /** Over-budget / rejected memory write title — not "Saved to memory". */
+      resultUnavailable: string
       memoryWriteNoted: string
       actions: {
         read: string
