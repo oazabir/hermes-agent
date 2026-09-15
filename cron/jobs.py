@@ -1653,7 +1653,17 @@ def _compute_provider_model_snapshots(
             if normalized_base_url:
                 runtime_kwargs["explicit_base_url"] = normalized_base_url
             snap = resolve_runtime_provider(**runtime_kwargs)
-            provider_snapshot = str(snap.get("provider") or "").strip().lower() or None
+            # Snapshot the KEYED provider identity, not the collapsed billing class. ``provider``
+            # is only the billing class ("custom"), while a keyed custom provider's configured id
+            # is "custom:<key>" (``requested_provider``). Storing the bare class made every such
+            # job's snapshot unmatchable at fire time: ``requested="custom"`` matches no configured
+            # provider key, so the resolver ladder fell through to the OpenRouter fallback, which
+            # RETURNS a credential-less runtime instead of raising — the job then died 401 on its
+            # first call and never reached the auth-error fallback path. Fall back to the billing
+            # class when no keyed identity is present.
+            provider_snapshot = (
+                str(snap.get("requested_provider") or snap.get("provider") or "").strip().lower()
+                or None)
     if normalized_model is None:
         with contextlib.suppress(Exception):
             model_snapshot = _resolve_default_model_snapshot() or None
